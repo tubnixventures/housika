@@ -1,11 +1,11 @@
-name: Build and Push to GHCR
+name: Build, Push to GHCR, and Deploy to Bunny
 
 on:
   push:
     branches: [main]
 
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     permissions:
@@ -30,3 +30,13 @@ jobs:
     - name: Push Docker image
       run: |
         docker push ghcr.io/tubnixventures/housika:latest
+
+    - name: Deploy to Bunny Magic Containers
+      run: |
+        curl -X POST https://containers.api.bunny.net/v1/deploy \
+          -H "AccessKey: ${{ secrets.BUNNY_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "projectId": "KvCgVPOif0c2oCx",
+            "image": "ghcr.io/tubnixventures/housika:latest"
+          }'

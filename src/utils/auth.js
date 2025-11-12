@@ -7,9 +7,9 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_very_secret_key_change_me';
 const JWT_EXPIRATION = process.env.JWT_EXPIRATION || '7d';
 
 const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+  url: 'https://gorgeous-ghoul-15689.upstash.io',
+  token: 'AT1JAAIncDJmNWUzYWI1Y2M2ZTY0NzA0YWFiYmJjMmUxMmU5MjM0MXAyMTU2ODk',
+})
 
 /**
  * Converts JWT_EXPIRATION to seconds for Redis TTL
