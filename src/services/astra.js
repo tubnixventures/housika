@@ -5,44 +5,30 @@ const {
   ASTRA_DB_NAMESPACE = 'default_keyspace',
 } = process.env;
 
-const baseUrl = `https://${ASTRA_DB_ID}-${ASTRA_DB_REGION}.apps.astra.datastax.com`;
-const basePath = `${baseUrl}/api/rest/v2/namespaces/${ASTRA_DB_NAMESPACE}/collections`;
+const basePath = `https://${ASTRA_DB_ID}-${ASTRA_DB_REGION}.apps.astra.datastax.com/api/rest/v2/namespaces/${ASTRA_DB_NAMESPACE}/collections`;
+const headers = {
+  'X-Cassandra-Token': ASTRA_DB_APPLICATION_TOKEN,
+  'Content-Type': 'application/json',
+};
 
-let setupError = null;
-let setupPromise = null;
-const collectionCache = new Map();
+let setupError, setupPromise;
+const cache = new Map();
 
-/**
- * Internal lazy initializer
- */
 const ensureClientReady = async () => {
   if (setupError) throw setupError;
   if (setupPromise) return setupPromise;
 
   setupPromise = (async () => {
     if (!ASTRA_DB_ID || !ASTRA_DB_REGION || !ASTRA_DB_APPLICATION_TOKEN) {
-      setupError = new Error('❌ Missing Astra DB credentials in environment.');
+      setupError = new Error('Missing Astra DB credentials.');
       return;
     }
 
     try {
-      console.log('🔍 Verifying Astra DB connection...');
-      const res = await fetch(basePath, {
-        method: 'GET',
-        headers: {
-          'X-Cassandra-Token': ASTRA_DB_APPLICATION_TOKEN,
-          'Content-Type': 'application/json',
-        },
-      });
-
-      if (!res.ok) {
-        throw new Error(`Unexpected status ${res.status}`);
-      }
-
-      console.log(`✅ Astra DB connection verified: ${res.status}`);
+      const res = await fetch(basePath, { method: 'GET', headers });
+      if (!res.ok) throw new Error(`Status ${res.status}`);
     } catch (err) {
-      setupError = new Error(`❌ Astra DB setup failed: ${err.message || 'Unknown error'}`);
-      console.error(setupError);
+      setupError = new Error(`Setup failed: ${err.message}`);
     }
   })();
 
@@ -50,37 +36,25 @@ const ensureClientReady = async () => {
   if (setupError) throw setupError;
 };
 
-/**
- * Returns collection operations for a given name.
- * Ensures Astra client is ready before returning handlers.
- */
-export const getCollection = async (collectionName) => {
-  if (!collectionName) throw new Error('❌ Collection name must be provided.');
+export const getCollection = async (name) => {
+  if (!name) throw new Error('Collection name required.');
   await ensureClientReady();
+  if (cache.has(name)) return cache.get(name);
 
-  if (collectionCache.has(collectionName)) {
-    return collectionCache.get(collectionName);
-  }
-
-  const collectionPath = `${basePath}/${collectionName}`;
-  const headers = {
-    'X-Cassandra-Token': ASTRA_DB_APPLICATION_TOKEN,
-    'Content-Type': 'application/json',
-  };
-
-  const handlers = {
-    get: async (docId) => fetch(`${collectionPath}/${docId}`, { method: 'GET', headers }).then(r => r.json()),
-    post: async (data) => fetch(collectionPath, { method: 'POST', headers, body: JSON.stringify(data) }).then(r => r.json()),
-    put: async (docId, data) => fetch(`${collectionPath}/${docId}`, { method: 'PUT', headers, body: JSON.stringify(data) }).then(r => r.json()),
-    patch: async (docId, data) => fetch(`${collectionPath}/${docId}`, { method: 'PATCH', headers, body: JSON.stringify(data) }).then(r => r.json()),
-    delete: async (docId) => fetch(`${collectionPath}/${docId}`, { method: 'DELETE', headers }).then(r => r.json()),
-    find: async (query) => {
-      const url = new URL(collectionPath);
-      url.searchParams.append('where', JSON.stringify(query));
-      return fetch(url.toString(), { method: 'GET', headers }).then(r => r.json());
+  const url = `${basePath}/${name}`;
+  const ops = {
+    get: (id) => fetch(`${url}/${id}`, { method: 'GET', headers }).then(r => r.json()),
+    post: (data) => fetch(url, { method: 'POST', headers, body: JSON.stringify(data) }).then(r => r.json()),
+    put: (id, data) => fetch(`${url}/${id}`, { method: 'PUT', headers, body: JSON.stringify(data) }).then(r => r.json()),
+    patch: (id, data) => fetch(`${url}/${id}`, { method: 'PATCH', headers, body: JSON.stringify(data) }).then(r => r.json()),
+    delete: (id) => fetch(`${url}/${id}`, { method: 'DELETE', headers }).then(r => r.json()),
+    find: (query) => {
+      const u = new URL(url);
+      u.searchParams.append('where', JSON.stringify(query));
+      return fetch(u.toString(), { method: 'GET', headers }).then(r => r.json());
     },
   };
 
-  collectionCache.set(collectionName, handlers);
-  return handlers;
+  cache.set(name, ops);
+  return ops;
 };

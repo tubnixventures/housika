@@ -35,7 +35,7 @@ const profile = async (c) => {
 
   try {
     const users = await getCollection(USERS_COLLECTION);
-    const userDoc = await users.get(decoded.userId);
+    const userDoc = await users.findOne({ userId: decoded.userId });
     const data = userDoc?.data;
 
     if (!data) {

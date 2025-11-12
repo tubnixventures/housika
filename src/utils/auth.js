@@ -9,92 +9,40 @@ const JWT_EXPIRATION = process.env.JWT_EXPIRATION || '7d';
 const redis = new Redis({
   url: 'https://gorgeous-ghoul-15689.upstash.io',
   token: 'AT1JAAIncDJmNWUzYWI1Y2M2ZTY0NzA0YWFiYmJjMmUxMmU5MjM0MXAyMTU2ODk',
-})
+});
 
-/**
- * Converts JWT_EXPIRATION to seconds for Redis TTL
- */
-function getRedisTTL(expiration = JWT_EXPIRATION) {
-  const match = expiration.match(/^(\d+)([smhd])$/);
-  if (!match) return 604800;
+const getRedisTTL = (exp = JWT_EXPIRATION) => {
+  const [, val, unit] = exp.match(/^(\d+)([smhd])$/) || [];
+  const n = parseInt(val);
+  return unit === 's' ? n : unit === 'm' ? n * 60 : unit === 'h' ? n * 3600 : unit === 'd' ? n * 86400 : 604800;
+};
 
-  const value = parseInt(match[1]);
-  const unit = match[2];
-
-  switch (unit) {
-    case 's': return value;
-    case 'm': return value * 60;
-    case 'h': return value * 3600;
-    case 'd': return value * 86400;
-    default: return 604800;
-  }
-}
-
-/**
- * Assigns a JWT and stores it in Redis with TTL
- */
-async function assignToken(payload) {
-  const token = sign(
-    {
-      userId: payload.userId,
-      email: payload.email,
-      role: payload.role,
-    },
-    JWT_SECRET,
-    { expiresIn: JWT_EXPIRATION }
-  );
-
-  const redisKey = `auth:${payload.userId}:${token}`;
-  const ttl = getRedisTTL(JWT_EXPIRATION);
-
-  await redis.set(redisKey, 'active', { ex: ttl });
-
+const assignToken = async ({ userId, email, role }) => {
+  const token = sign({ userId, email, role }, JWT_SECRET, { expiresIn: JWT_EXPIRATION });
+  await redis.set(`auth:${userId}:${token}`, 'active', { ex: getRedisTTL() });
   return token;
-}
+};
 
-/**
- * Verifies JWT and checks Redis for session validity
- */
-async function checkToken(token) {
+const checkToken = async (token) => {
   if (!token) return null;
-
   try {
     const payload = verify(token, JWT_SECRET);
-    const redisKey = `auth:${payload.userId}:${token}`;
-    const exists = await redis.get(redisKey);
-
+    const exists = await redis.get(`auth:${payload.userId}:${token}`);
     return exists ? payload : null;
   } catch {
     return null;
   }
-}
+};
 
-/**
- * Deletes a specific token from Redis (logout)
- */
-async function deleteToken(userId, token) {
-  const redisKey = `auth:${userId}:${token}`;
-  await redis.del(redisKey);
-}
+const deleteToken = async (userId, token) => redis.del(`auth:${userId}:${token}`);
 
-/**
- * Deletes all tokens for a user (multi-session logout)
- */
-async function deleteAllTokens(userId) {
+const deleteAllTokens = async (userId) => {
   const keys = await redis.keys(`auth:${userId}:*`);
-  if (keys.length > 0) {
-    await redis.del(...keys);
-  }
-}
+  if (keys.length) await redis.del(...keys);
+};
 
-/**
- * Role check utility
- */
-function roleCheck(payload, requiredRoles) {
-  if (!payload?.role) return false;
-  const roles = Array.isArray(requiredRoles) ? requiredRoles : [requiredRoles];
-  return roles.includes(payload.role);
-}
+const roleCheck = (payload, required) =>
+  !!payload?.role && (Array.isArray(required) ? required : [required]).includes(payload.role);
 
 export {
   assignToken,

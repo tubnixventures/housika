@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+
 import authRoutes from './auth/routes.js';
 import roomsRoutes from './rooms/routes.js';
 import propertiesRoutes from './properties/routes.js';
@@ -11,29 +12,28 @@ import usersRoutes from './users/routes.js';
 import emailRoutes from './emails/routes.js';
 import bookingsRoutes from './bookings/routes.js';
 import paymentsRoutes from './payments/routes.js';
-import receiptRoutes from './receipts/routes.js'; // ✅ Import receipt routes
+import receiptRoutes from './receipts/routes.js';
 
-const appRouter = new Hono();
+const app = new Hono();
 
 // --- Public Routes ---
-appRouter.route('/contactMessages', contactMessagesRoutes);
-appRouter.route('/banners', bannersRoutes);
-appRouter.route('/countries', countriesRoutes);
-appRouter.route('/upload', uploadRoutes);
-appRouter.route('/emails', emailRoutes);
-appRouter.route('/payments', paymentsRoutes);
-appRouter.route('/receipts', receiptRoutes); // ✅ Mount receipt routes
+app.route('/contactMessages', contactMessagesRoutes);
+app.route('/banners', bannersRoutes);
+app.route('/countries', countriesRoutes);
+app.route('/upload', uploadRoutes);
+app.route('/emails', emailRoutes);
+app.route('/payments', paymentsRoutes);
+app.route('/receipts', receiptRoutes);
 
-// --- API Router Groups ---
-appRouter.route('/properties', propertiesRoutes);
-appRouter.route('/auth', authRoutes);
-appRouter.route('/rooms', roomsRoutes);
-appRouter.route('/chats', chatsRoutes);
-appRouter.route('/users', usersRoutes);
-appRouter.route('/bookings', bookingsRoutes);
+// --- Authenticated API Routes ---
+app.route('/auth', authRoutes);
+app.route('/properties', propertiesRoutes);
+app.route('/rooms', roomsRoutes);
+app.route('/chats', chatsRoutes);
+app.route('/users', usersRoutes);
+app.route('/bookings', bookingsRoutes);
 
-appRouter.get('/', (c) => {
-  return c.text('Hono API is running!');
-});
+// --- Health Check ---
+app.get('/', (c) => c.text('✅ Hono API ready'));
 
-export default appRouter;
+export default app;

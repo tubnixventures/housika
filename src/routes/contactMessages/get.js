@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { getCollection } from '../../services/astra.js';
 import { checkToken } from '../../utils/auth.js';
 
@@ -8,41 +9,40 @@ import { checkToken } from '../../utils/auth.js';
  */
 export const getContactMessages = async (c) => {
   const timestamp = new Date().toISOString();
+  const traceId = c.req.header('x-trace-id') || crypto.randomUUID();
   const token = c.req.header('Authorization')?.replace('Bearer ', '');
-  const actor = token ? await checkToken(token) : null;
+
+  const [actorResult, collectionResult] = await Promise.allSettled([
+    token ? checkToken(token) : null,
+    getCollection('contact_messages'),
+  ]);
+
+  const actor = actorResult.status === 'fulfilled' ? actorResult.value : null;
+  const contactMessages = collectionResult.status === 'fulfilled' ? collectionResult.value : null;
 
   if (!actor || !['customer care', 'admin', 'ceo'].includes(actor.role)) {
-    return c.json(
-      {
-        success: false,
-        error: 'UNAUTHORIZED',
-        message: 'Only customer care, admin, or ceo can view contact messages.',
-        timestamp,
-      },
-      403
-    );
+    return c.json({
+      success: false,
+      error: 'UNAUTHORIZED',
+      message: 'Only customer care, admin, or ceo can view contact messages.',
+      timestamp,
+      traceId,
+    }, 403);
   }
 
-  let contactMessages;
-  try {
-    contactMessages = await getCollection('contact_messages');
-    if (!contactMessages?.find || typeof contactMessages.find !== 'function') {
-      throw new Error('Collection "contact_messages" missing .find() method.');
+  if (!contactMessages) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ DB connection failed:', collectionResult.reason?.message || collectionResult.reason);
     }
-  } catch (err) {
-    console.error('❌ DB connection error:', err.message || err);
-    return c.json(
-      {
-        success: false,
-        error: 'DB_CONNECTION_FAILED',
-        message: 'Database connection failed.',
-        timestamp,
-      },
-      503
-    );
+    return c.json({
+      success: false,
+      error: 'DB_CONNECTION_FAILED',
+      message: 'Database connection failed.',
+      timestamp,
+      traceId,
+    }, 503);
   }
 
-  // Optional filters
   const emailFilter = c.req.query('email');
   const fromDate = c.req.query('from');
   const toDate = c.req.query('to');
@@ -58,22 +58,19 @@ export const getContactMessages = async (c) => {
   let messages = [];
   try {
     const result = await contactMessages.find(query);
-    messages = result?.data && typeof result.data === 'object' ? Object.values(result.data) : [];
+    messages = Object.values(result?.data || {});
     messages.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  } catch (queryErr) {
-    console.error('❌ Query failed:', queryErr.message || queryErr);
-    if (queryErr.response?.data) {
-      console.error('📄 Astra error response:', JSON.stringify(queryErr.response.data, null, 2));
+  } catch (err) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ Query failed:', err.message || err);
     }
-    return c.json(
-      {
-        success: false,
-        error: 'QUERY_FAILED',
-        message: 'Failed to retrieve contact messages.',
-        timestamp,
-      },
-      500
-    );
+    return c.json({
+      success: false,
+      error: 'QUERY_FAILED',
+      message: 'Failed to retrieve contact messages.',
+      timestamp,
+      traceId,
+    }, 500);
   }
 
   return c.json({
@@ -81,5 +78,7 @@ export const getContactMessages = async (c) => {
     count: messages.length,
     data: messages,
     timestamp,
-  });
+    traceId,
+    actor_id: actor.userId,
+  }, 200);
 };

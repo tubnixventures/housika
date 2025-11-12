@@ -8,11 +8,11 @@ const verify = async (c) => {
   const timestamp = new Date().toISOString();
   const receiptId = c.req.param('receipt_id');
 
-  if (!receiptId || typeof receiptId !== 'string') {
+  if (!receiptId || typeof receiptId !== 'string' || !receiptId.startsWith('RCT-')) {
     return c.json({
       success: false,
       error: 'INVALID_RECEIPT_ID',
-      message: 'Receipt ID is required and must be a string.',
+      message: 'Receipt ID must be a valid string starting with "RCT-".',
       timestamp,
     }, 400);
   }
@@ -60,7 +60,15 @@ const verify = async (c) => {
   return c.json({
     success: true,
     verified: true,
-    receipt,
+    receipt_id: receipt.receipt_id,
+    tenant_name: receipt.tenant_name,
+    property_name: receipt.property_name,
+    issued_by: receipt.created_by,
+    issued_role: receipt.created_role,
+    issued_at: receipt.created_at,
+    next_payment_date: receipt.next_payment_date || null,
+    receipt_url: receipt.public_url || null,
+    verify_url: `https://housika.io/verify?receipt_id=${receipt.receipt_id}`,
     timestamp,
   });
 };

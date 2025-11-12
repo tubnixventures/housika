@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { getCollection } from '../../services/astra.js';
 
 /**
@@ -7,45 +8,39 @@ import { getCollection } from '../../services/astra.js';
  */
 export const getChats = async (c) => {
   const timestamp = new Date().toISOString();
+  const traceId = c.req.header('x-trace-id') || crypto.randomUUID();
 
-  let chatsCollection;
+  let chatsCol;
   try {
-    chatsCollection = await getCollection('chats');
-    if (!chatsCollection?.find || typeof chatsCollection.find !== 'function') {
-      throw new Error('Collection object missing .find() method.');
-    }
-    console.log('📦 Connected to collection: chats');
+    chatsCol = await getCollection('chats');
   } catch (err) {
-    console.error('❌ DB connection error:', err.message || err);
-    return c.json(
-      {
-        success: false,
-        error: 'DB_CONNECTION_FAILED',
-        message: 'Database connection failed.',
-        timestamp,
-      },
-      503
-    );
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ DB connection failed:', err.message || err);
+    }
+    return c.json({
+      success: false,
+      error: 'DB_CONNECTION_FAILED',
+      message: 'Database connection failed.',
+      timestamp,
+      traceId,
+    }, 503);
   }
 
   let chats = [];
   try {
-    const result = await chatsCollection.find({});
-    chats = result?.data && typeof result.data === 'object' ? Object.values(result.data) : [];
-  } catch (queryErr) {
-    console.error('❌ Chat query failed:', queryErr.message || queryErr);
-    if (queryErr.response?.data) {
-      console.error('📄 Astra error response:', JSON.stringify(queryErr.response.data, null, 2));
+    const result = await chatsCol.find({});
+    chats = Object.values(result?.data || {});
+  } catch (err) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ Chat query failed:', err.message || err);
     }
-    return c.json(
-      {
-        success: false,
-        error: 'DB_QUERY_FAILED',
-        message: 'Unable to retrieve chats at this time.',
-        timestamp,
-      },
-      500
-    );
+    return c.json({
+      success: false,
+      error: 'DB_QUERY_FAILED',
+      message: 'Unable to retrieve chats at this time.',
+      timestamp,
+      traceId,
+    }, 500);
   }
 
   return c.json({
@@ -53,5 +48,6 @@ export const getChats = async (c) => {
     count: chats.length,
     data: chats,
     timestamp,
-  });
+    traceId,
+  }, 200);
 };

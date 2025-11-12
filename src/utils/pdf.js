@@ -1,71 +1,44 @@
 import puppeteer from 'puppeteer';
 
-let browserInstance = null;
-let setupError = null;
-let setupPromise = null;
+let browser, setupError, setupPromise;
 
-/**
- * Internal lazy initializer for Puppeteer
- */
-async function ensureBrowserReady() {
+const ensureBrowserReady = async () => {
   if (setupError) throw setupError;
-  if (browserInstance) return;
+  if (browser) return;
 
   if (!setupPromise) {
-    setupPromise = (async () => {
-      try {
-        browserInstance = await puppeteer.launch({
-          headless: true,
-          args: ['--no-sandbox', '--disable-setuid-sandbox'],
-          defaultViewport: { width: 1280, height: 800 },
-        });
-      } catch (err) {
-        setupError = new Error(`❌ Failed to launch Puppeteer: ${err.message}`);
-      }
-    })();
+    setupPromise = puppeteer
+      .launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        defaultViewport: { width: 1280, height: 800 },
+      })
+      .then(b => (browser = b))
+      .catch(err => {
+        setupError = new Error(`Puppeteer launch failed: ${err.message}`);
+      });
   }
 
   await setupPromise;
   if (setupError) throw setupError;
-}
+};
 
-/**
- * Converts HTML string to PDF buffer using Puppeteer
- * @param {string} html - HTML content to render
- * @returns {Promise<Buffer>} - PDF buffer
- */
 export async function htmlToPdfBuffer(html) {
-  if (!html || typeof html !== 'string' || html.trim().length === 0) {
-    throw new Error('Invalid HTML input: HTML string is empty or malformed.');
-  }
-
+  if (!html?.trim()) throw new Error('HTML input is empty or invalid.');
   await ensureBrowserReady();
 
-  let page = null;
+  const page = await browser.newPage();
   try {
-    page = await browserInstance.newPage();
-
-    await page.setContent(html, {
-      waitUntil: 'domcontentloaded',
-      timeout: 10000, // 10s timeout for safety
-    });
-
-    const pdfBuffer = await page.pdf({
+    await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    return await page.pdf({
       format: 'A4',
       printBackground: true,
-      margin: {
-        top: '40px',
-        bottom: '40px',
-        left: '30px',
-        right: '30px',
-      },
+      margin: { top: '40px', bottom: '40px', left: '30px', right: '30px' },
     });
-
-    return pdfBuffer;
-  } catch (error) {
-    console.error('❌ PDF generation failed:', error);
-    throw new Error('Failed to generate PDF from HTML.');
+  } catch (err) {
+    console.error('❌ PDF generation failed:', err);
+    throw new Error('PDF generation failed.');
   } finally {
-    if (page) await page.close();
+    await page.close();
   }
 }

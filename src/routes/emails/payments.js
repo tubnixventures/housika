@@ -1,12 +1,11 @@
 import { initZeptoMail, ZeptoMailError } from '../../services/zeptoEmail.js';
-import { checkToken } from '../../utils/auth.js';
 
 /**
- * POST /emails/admin
- * Sends a professional admin email from Housika Properties.
- * Restricted to admin role.
+ * POST /emails/payments
+ * Sends a payment confirmation email from Housika Properties.
+ * Public access – no token required.
  */
-export const postAdminEmail = async (c) => {
+export const postPaymentEmail = async (c) => {
   const timestamp = new Date().toISOString();
 
   let body;
@@ -23,31 +22,19 @@ export const postAdminEmail = async (c) => {
     }, 400);
   }
 
-  const token = c.req.header('Authorization')?.replace('Bearer ', '');
-  const user = token ? await checkToken(token) : null;
-
-  if (!user || user.role !== 'admin') {
-    return c.json({
-      success: false,
-      error: 'UNAUTHORIZED',
-      message: 'Only admin is authorized to send this type of email.',
-      timestamp,
-    }, 403);
-  }
-
-  const { to, message, time } = body;
-  if (!to || !message || !time) {
+  const { to, reference, time, purpose } = body;
+  if (!to || !reference || !time || !purpose) {
     return c.json({
       success: false,
       error: 'MISSING_FIELDS',
-      message: 'Required fields: to, message, and time must be provided.',
+      message: 'Required fields: to, reference, time, and purpose must be provided.',
       timestamp,
     }, 400);
   }
 
   try {
     const zepto = await initZeptoMail(c.env);
-    const subject = `Housika Admin Notice – ${new Date(time).toLocaleDateString()}`;
+    const subject = `Payment Confirmation – ${new Date(time).toLocaleDateString()}`;
     const htmlbody = `
 <!DOCTYPE html>
 <html>
@@ -70,7 +57,7 @@ export const postAdminEmail = async (c) => {
       box-shadow: 0 4px 20px rgba(0,0,0,0.08);
     }
     h2 {
-      color: #1b3bb3;
+      color: #28a745;
       margin-bottom: 10px;
     }
     p {
@@ -86,7 +73,7 @@ export const postAdminEmail = async (c) => {
       text-align: center;
     }
     .footer a {
-      color: #1b3bb3;
+      color: #b31b1b;
       text-decoration: none;
       margin: 0 10px;
     }
@@ -94,23 +81,16 @@ export const postAdminEmail = async (c) => {
 </head>
 <body>
   <div class="container">
-    <h2>Housika Properties – Admin Desk</h2>
-    <p>Dear Stakeholder,</p>
-    <p>${message}</p>
-    <p style="font-size: 14px; color: #555;">
-      This message was issued by the Housika Admin Desk and is logged for audit purposes.
-    </p>
+    <h2>Payment Confirmation – Housika Properties</h2>
+    <p>Dear Customer,</p>
+    <p>We’ve received your payment successfully.</p>
+    <p><strong>Reference:</strong> ${reference}</p>
+    <p><strong>Time Paid:</strong> ${new Date(time).toLocaleString()}</p>
+    <p><strong>Purpose:</strong> ${purpose}</p>
+    <p>This transaction has been logged and verified. You may retain this email as proof of payment.</p>
     <div class="footer">
       <p>Housika Properties is operated under Pansoft Technologies Kenya (BN-36S5WLAP).</p>
-      <p>Current CEO: <strong>Movin Wanjala Juma</strong></p>
-      <p>Contact: <a href="mailto:admin@housika.co.ke">admin@housika.co.ke</a></p>
-      <p>
-        <a href="https://wa.me/254785103445">📱 WhatsApp</a>
-        <a href="tel:+254785103445">📞 Call</a>
-        <a href="sms:+254785103445">💬 Message</a>
-        <a href="https://facebook.com/housikaproperties">📘 Facebook</a>
-      </p>
-      <p style="font-size: 12px; color: #999;">This message is confidential and intended for the recipient only.</p>
+      <p>Need help? <a href="mailto:customercare@housika.co.ke">customercare@housika.co.ke</a></p>
     </div>
   </div>
 </body>
@@ -121,12 +101,12 @@ export const postAdminEmail = async (c) => {
       to,
       subject,
       htmlbody,
-      recipientName: 'Stakeholder',
+      recipientName: 'Customer',
     });
 
     return c.json({
       success: true,
-      message: 'Admin email sent successfully.',
+      message: 'Payment confirmation email sent successfully.',
       result,
       timestamp,
     });

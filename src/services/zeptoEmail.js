@@ -14,13 +14,8 @@ export class ZeptoMailError extends Error {
   }
 }
 
-let zeptoApiKey = null;
-let setupError = null;
-let setupPromise = null;
+let zeptoApiKey, setupError, setupPromise;
 
-/**
- * Internal lazy initializer
- */
 const ensureReady = async (env) => {
   if (setupError) throw setupError;
   if (zeptoApiKey) return;
@@ -28,10 +23,8 @@ const ensureReady = async (env) => {
   if (!setupPromise) {
     setupPromise = (async () => {
       zeptoApiKey = env?.ZEPTO_API_KEY || process.env.ZEPTO_API_KEY;
-      if (!zeptoApiKey || !zeptoApiKey.startsWith('Zoho-')) {
-        setupError = new ZeptoMailError('❌ ZeptoMail API key missing or malformed.');
-      } else {
-        console.log('🔐 ZeptoMail initialized with secure sender bindings.');
+      if (!zeptoApiKey?.startsWith('Zoho-')) {
+        setupError = new ZeptoMailError('ZeptoMail API key missing or malformed.');
       }
     })();
   }
@@ -40,36 +33,22 @@ const ensureReady = async (env) => {
   if (setupError) throw setupError;
 };
 
-/**
- * Initializes ZeptoMail utility with environment bindings
- * @param {object} env - Environment object (e.g., Cloudflare Worker bindings)
- * @returns {object} - Email sending methods
- */
 export async function initZeptoMail(env) {
   await ensureReady(env);
 
   const formatRecipients = (to, name = 'User') => {
-    if (!to) throw new ZeptoMailError('Recipient email(s) missing.');
-    const recipients = Array.isArray(to) ? to : [to];
-    return recipients.map(email => {
+    const list = Array.isArray(to) ? to : [to];
+    return list.map(email => {
       if (typeof email !== 'string' || !email.includes('@')) {
-        throw new ZeptoMailError(`Invalid recipient email: ${email}`);
+        throw new ZeptoMailError(`Invalid recipient: ${email}`);
       }
-      return {
-        email_address: {
-          address: email,
-          name,
-        },
-      };
+      return { email_address: { address: email, name } };
     });
   };
 
   const sendEmail = async ({ sender, to, subject, htmlbody, recipientName = 'User' }) => {
-    if (!sender?.address || !sender?.name) {
-      throw new ZeptoMailError('Sender object is missing required fields.');
-    }
-    if (!to || !subject || !htmlbody) {
-      throw new ZeptoMailError('Missing required parameters: to, subject, and htmlbody are mandatory.');
+    if (!sender?.address || !sender?.name || !to || !subject || !htmlbody) {
+      throw new ZeptoMailError('Missing required email fields.');
     }
 
     const payload = {
@@ -83,29 +62,26 @@ export async function initZeptoMail(env) {
       const res = await fetch(ZEPTO_URL, {
         method: 'POST',
         headers: {
-          'Authorization': zeptoApiKey,
+          Authorization: zeptoApiKey,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(payload),
       });
 
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new ZeptoMailError(data.message || 'Email failed', data);
-      }
-
+      if (!res.ok) throw new ZeptoMailError(data.message || 'Email failed', data);
       return data;
     } catch (err) {
-      const errorDetails = err instanceof ZeptoMailError ? err.data : err.stack || err;
-      console.error(`[ZEPTOMAIL ERROR] Failed to send email from ${sender.address} to ${to}.`, errorDetails);
-      throw err instanceof ZeptoMailError ? err : new ZeptoMailError('Unexpected error during email dispatch.', errorDetails);
+      const detail = err instanceof ZeptoMailError ? err.data : err.stack || err;
+      console.error(`[ZEPTOMAIL ERROR] ${sender.address} → ${to}`, detail);
+      throw err instanceof ZeptoMailError ? err : new ZeptoMailError('Unexpected email error.', detail);
     }
   };
 
   return {
-    sendVerificationEmail: (params) => sendEmail({ sender: SENDERS.NO_REPLY, ...params }),
-    sendPasswordReset: (params) => sendEmail({ sender: SENDERS.NO_REPLY, ...params }),
-    sendBookingConfirmation: (params) => sendEmail({ sender: SENDERS.BOOKINGS, ...params }),
-    sendCustomerCareReply: (params) => sendEmail({ sender: SENDERS.CUSTOMER_CARE, ...params }),
+    sendVerificationEmail: (p) => sendEmail({ sender: SENDERS.NO_REPLY, ...p }),
+    sendPasswordReset: (p) => sendEmail({ sender: SENDERS.NO_REPLY, ...p }),
+    sendBookingConfirmation: (p) => sendEmail({ sender: SENDERS.BOOKINGS, ...p }),
+    sendCustomerCareReply: (p) => sendEmail({ sender: SENDERS.CUSTOMER_CARE, ...p }),
   };
 }

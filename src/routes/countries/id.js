@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { getCollection } from '../../services/astra.js';
 
 /**
@@ -6,72 +7,67 @@ import { getCollection } from '../../services/astra.js';
  */
 export const getCountryById = async (c) => {
   const timestamp = new Date().toISOString();
+  const traceId = c.req.header('x-trace-id') || crypto.randomUUID();
   const countryId = c.req.param('id');
 
   if (!countryId || typeof countryId !== 'string') {
-    return c.json(
-      {
-        success: false,
-        error: 'INVALID_COUNTRY_ID',
-        message: 'Country ID must be a valid string.',
-        timestamp,
-      },
-      400
-    );
+    return c.json({
+      success: false,
+      error: 'INVALID_COUNTRY_ID',
+      message: 'Country ID must be a valid string.',
+      timestamp,
+      traceId,
+    }, 400);
   }
 
-  let countriesCollection;
+  let countriesCol;
   try {
-    countriesCollection = await getCollection('countries');
-    console.log('📦 Connected to collection: countries');
+    countriesCol = await getCollection('countries');
   } catch (err) {
-    console.error('❌ DB connection error:', err.message || err);
-    return c.json(
-      {
-        success: false,
-        error: 'DB_CONNECTION_FAILED',
-        message: 'Database connection failed.',
-        timestamp,
-      },
-      503
-    );
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ DB connection failed:', err.message || err);
+    }
+    return c.json({
+      success: false,
+      error: 'DB_CONNECTION_FAILED',
+      message: 'Database connection failed.',
+      timestamp,
+      traceId,
+    }, 503);
   }
 
   let country;
   try {
-    const result = await countriesCollection.find({ _id: countryId });
+    const result = await countriesCol.find({ _id: countryId });
     country = Object.values(result?.data || {})[0];
-  } catch (queryErr) {
-    console.error('❌ Country lookup failed:', queryErr.message || queryErr);
-    if (queryErr.response?.data) {
-      console.error('📄 Astra error response:', JSON.stringify(queryErr.response.data, null, 2));
+  } catch (err) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ Country lookup failed:', err.message || err);
     }
-    return c.json(
-      {
-        success: false,
-        error: 'DB_QUERY_FAILED',
-        message: 'Failed to retrieve country.',
-        timestamp,
-      },
-      500
-    );
+    return c.json({
+      success: false,
+      error: 'DB_QUERY_FAILED',
+      message: 'Failed to retrieve country.',
+      timestamp,
+      traceId,
+    }, 500);
   }
 
   if (!country) {
-    return c.json(
-      {
-        success: false,
-        error: 'COUNTRY_NOT_FOUND',
-        message: `No country found with ID "${countryId}".`,
-        timestamp,
-      },
-      404
-    );
+    return c.json({
+      success: false,
+      error: 'COUNTRY_NOT_FOUND',
+      message: `No country found with ID "${countryId}".`,
+      timestamp,
+      traceId,
+    }, 404);
   }
 
   return c.json({
     success: true,
+    country_id: countryId,
     data: country,
     timestamp,
-  });
+    traceId,
+  }, 200);
 };

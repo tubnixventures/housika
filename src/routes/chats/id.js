@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { getCollection } from '../../services/astra.js';
 
 /**
@@ -7,58 +8,50 @@ import { getCollection } from '../../services/astra.js';
  */
 export const getMessagesForChat = async (c) => {
   const timestamp = new Date().toISOString();
+  const traceId = c.req.header('x-trace-id') || crypto.randomUUID();
   const chatId = c.req.param('id');
 
   if (!chatId || typeof chatId !== 'string') {
-    return c.json(
-      {
-        success: false,
-        error: 'INVALID_CHAT_ID',
-        message: 'Chat ID must be a valid string.',
-        timestamp,
-      },
-      400
-    );
+    return c.json({
+      success: false,
+      error: 'INVALID_CHAT_ID',
+      message: 'Chat ID must be a valid string.',
+      timestamp,
+      traceId,
+    }, 400);
   }
 
-  let messagesCollection;
+  let messagesCol;
   try {
-    messagesCollection = await getCollection('messages');
-    if (!messagesCollection?.find || typeof messagesCollection.find !== 'function') {
-      throw new Error('Collection object missing .find() method.');
-    }
-    console.log('📦 Connected to collection: messages');
+    messagesCol = await getCollection('messages');
   } catch (err) {
-    console.error('❌ DB connection error:', err.message || err);
-    return c.json(
-      {
-        success: false,
-        error: 'DB_CONNECTION_FAILED',
-        message: 'Database connection failed.',
-        timestamp,
-      },
-      503
-    );
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ DB connection failed:', err.message || err);
+    }
+    return c.json({
+      success: false,
+      error: 'DB_CONNECTION_FAILED',
+      message: 'Database connection failed.',
+      timestamp,
+      traceId,
+    }, 503);
   }
 
   let messages = [];
   try {
-    const result = await messagesCollection.find({ chatId: { $eq: chatId } });
-    messages = result?.data && typeof result.data === 'object' ? Object.values(result.data) : [];
-  } catch (queryErr) {
-    console.error('❌ Message query failed:', queryErr.message || queryErr);
-    if (queryErr.response?.data) {
-      console.error('📄 Astra error response:', JSON.stringify(queryErr.response.data, null, 2));
+    const result = await messagesCol.find({ chatId: { $eq: chatId } });
+    messages = Object.values(result?.data || {});
+  } catch (err) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ Message query failed:', err.message || err);
     }
-    return c.json(
-      {
-        success: false,
-        error: 'DB_QUERY_FAILED',
-        message: 'Failed to retrieve chat messages.',
-        timestamp,
-      },
-      500
-    );
+    return c.json({
+      success: false,
+      error: 'DB_QUERY_FAILED',
+      message: 'Failed to retrieve chat messages.',
+      timestamp,
+      traceId,
+    }, 500);
   }
 
   return c.json({
@@ -67,5 +60,6 @@ export const getMessagesForChat = async (c) => {
     count: messages.length,
     data: messages,
     timestamp,
-  });
+    traceId,
+  }, 200);
 };

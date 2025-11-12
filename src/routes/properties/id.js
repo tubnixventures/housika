@@ -6,39 +6,36 @@ const isUUID = (id) =>
 
 /**
  * GET /properties/:id
- * Returns a specific property and its associated rooms.
+ * Returns a specific property, its rooms, and its reviews.
  */
 export const getPropertyById = async (c) => {
   const timestamp = new Date().toISOString();
   const propertyId = c.req.param('id');
 
   if (!propertyId || !isUUID(propertyId)) {
-    return c.json(
-      {
-        success: false,
-        error: 'INVALID_PROPERTY_ID',
-        message: 'Property ID must be a valid UUID.',
-        timestamp,
-      },
-      400
-    );
+    return c.json({
+      success: false,
+      error: 'INVALID_PROPERTY_ID',
+      message: 'Property ID must be a valid UUID.',
+      timestamp,
+    }, 400);
   }
 
-  let propertiesCollection, roomsCollection;
+  let propertiesCollection, roomsCollection, reviewsCollection;
   try {
-    propertiesCollection = await getCollection('properties');
-    roomsCollection = await getCollection('rooms');
+    [propertiesCollection, roomsCollection, reviewsCollection] = await Promise.all([
+      getCollection('properties'),
+      getCollection('rooms'),
+      getCollection('reviews'),
+    ]);
   } catch (err) {
     console.error('❌ DB connection error:', err.message || err);
-    return c.json(
-      {
-        success: false,
-        error: 'DB_CONNECTION_FAILED',
-        message: 'Database connection failed.',
-        timestamp,
-      },
-      503
-    );
+    return c.json({
+      success: false,
+      error: 'DB_CONNECTION_FAILED',
+      message: 'Database connection failed.',
+      timestamp,
+    }, 503);
   }
 
   let property;
@@ -47,41 +44,33 @@ export const getPropertyById = async (c) => {
     property = Object.values(result?.data || {})[0];
 
     if (!property) {
-      return c.json(
-        {
-          success: false,
-          error: 'PROPERTY_NOT_FOUND',
-          message: `No property found with ID "${propertyId}".`,
-          timestamp,
-        },
-        404
-      );
-    }
-  } catch (queryErr) {
-    console.error(`❌ Property query failed for ID ${propertyId}:`, queryErr.message || queryErr);
-    if (queryErr.response?.data) {
-      console.error('📄 Astra property query response:', JSON.stringify(queryErr.response.data, null, 2));
-    }
-    return c.json(
-      {
+      return c.json({
         success: false,
-        error: 'DB_QUERY_FAILED',
-        message: 'Failed to retrieve property.',
+        error: 'PROPERTY_NOT_FOUND',
+        message: `No property found with ID "${propertyId}".`,
         timestamp,
-      },
-      500
-    );
+      }, 404);
+    }
+  } catch (err) {
+    console.error(`❌ Property query failed for ID ${propertyId}:`, err.message || err);
+    return c.json({
+      success: false,
+      error: 'PROPERTY_QUERY_FAILED',
+      message: 'Failed to retrieve property.',
+      timestamp,
+    }, 500);
   }
 
-  let rooms = [];
+  let rooms = [], reviews = [];
   try {
-    const roomResult = await roomsCollection.find({ property_id: { $eq: propertyId } });
+    const [roomResult, reviewResult] = await Promise.all([
+      roomsCollection.find({ property_id: { $eq: propertyId } }),
+      reviewsCollection.find({ property_id: { $eq: propertyId }, status: { $eq: 'active' } }),
+    ]);
     rooms = Object.values(roomResult?.data || {});
-  } catch (roomErr) {
-    console.warn(`⚠️ Room query failed for property_id ${propertyId}:`, roomErr.message || roomErr);
-    if (roomErr.response?.data) {
-      console.warn('📄 Astra room query response:', JSON.stringify(roomErr.response.data, null, 2));
-    }
+    reviews = Object.values(reviewResult?.data || {}).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  } catch (err) {
+    console.warn(`⚠️ Room or review query failed for property_id ${propertyId}:`, err.message || err);
   }
 
   return c.json({
@@ -89,6 +78,7 @@ export const getPropertyById = async (c) => {
     data: {
       property,
       rooms,
+      reviews,
     },
     timestamp,
   });

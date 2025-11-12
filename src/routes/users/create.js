@@ -28,6 +28,7 @@ export const createUser = async (c) => {
   let body;
   try {
     body = await c.req.json();
+    if (!body || typeof body !== 'object') throw new Error('Invalid JSON');
   } catch {
     return c.json({
       success: false,
@@ -98,15 +99,20 @@ export const createUser = async (c) => {
   try {
     await usersCollection.post(userToCreate);
 
-    // Fire-and-forget email dispatch
+    // 📧 Fire-and-forget welcome email
     void (async () => {
       try {
         const zepto = await initZeptoMail(c.env);
-        const subject = `Welcome to Housika – Account Created`;
-        const htmlbody = generateWelcomeEmail(fullname);
-        await zepto.sendCustomerCareReply({ to: email, subject, htmlbody, recipientName: fullname });
+        const subject = `🎉 Welcome to Housika – Your ${role} Account Is Ready`;
+        const htmlbody = generateWelcomeEmail(fullname, role);
+        await zepto.sendCustomerCareReply({
+          to: email,
+          subject,
+          htmlbody,
+          recipientName: fullname,
+        });
       } catch (emailErr) {
-        console.warn('⚠️ Email dispatch failed:', emailErr.message || emailErr);
+        console.warn('⚠️ Welcome email dispatch failed:', emailErr.message || emailErr);
       }
     })();
 
@@ -130,26 +136,68 @@ export const createUser = async (c) => {
   }
 };
 
-/**
- * Generates welcome email HTML body
- */
-function generateWelcomeEmail(name) {
+
+function generateWelcomeEmail(name, role) {
   return `
-    <div style="font-family: 'Segoe UI', Roboto, Arial, sans-serif; padding: 40px; background-color: #f9f9f9;">
-      <div style="max-width: 700px; margin: auto; background: #fff; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.05); overflow: hidden;">
-        <header style="background-color: #b31b1b; color: #fff; padding: 20px 30px;">
-          <h2 style="margin: 0;">Welcome to Housika, ${name}!</h2>
-          <p style="margin: 5px 0 0; font-size: 0.95em;">Your account has been created successfully.</p>
-        </header>
-        <main style="padding: 30px;">
-          <p>You're now part of the Housika platform. You can log in and start managing your listings, bookings, or support tasks depending on your role.</p>
-          <p>If you have any questions, reach us via WhatsApp at <strong>+254785103445</strong> or email <a href="mailto:customercare@housika.co.ke">customercare@housika.co.ke</a>.</p>
-        </main>
-        <footer style="background-color: #f0f0f0; padding: 20px 30px; font-size: 0.85em; color: #666;">
-          <p>Housika Properties is a technology platform operated under Pansoft Technologies Kenya (BN-36S5WLAP).</p>
-          <p>This message is confidential and intended for the recipient only.</p>
-        </footer>
-      </div>
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+      background-color: #f4f4f4;
+    }
+    .container {
+      max-width: 700px;
+      margin: 40px auto;
+      background-color: #ffffff;
+      padding: 40px;
+      border-radius: 10px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+    }
+    h2 {
+      color: #b31b1b;
+      margin-bottom: 10px;
+    }
+    p {
+      color: #333333;
+      font-size: 16px;
+      line-height: 1.6;
+      margin: 12px 0;
+    }
+    .footer {
+      margin-top: 40px;
+      font-size: 13px;
+      color: #777777;
+      text-align: center;
+    }
+    .footer a {
+      color: #b31b1b;
+      text-decoration: none;
+      margin: 0 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Welcome to Housika, ${name}!</h2>
+    <p>Your account has been successfully created with the role: <strong>${role}</strong>.</p>
+    <p>You can now log in and begin managing your listings, bookings, or support tasks depending on your assigned role.</p>
+    <p>If you have any questions, reach us via:</p>
+    <p>
+      📱 WhatsApp: <strong>+254785103445</strong><br/>
+      📧 Email: <a href="mailto:customercare@housika.co.ke">customercare@housika.co.ke</a>
+    </p>
+    <div class="footer">
+      <p>Housika Properties is operated under Pansoft Technologies Kenya (BN-36S5WLAP).</p>
+      <p>This message is confidential and intended for the recipient only.</p>
     </div>
+  </div>
+</body>
+</html>
   `;
 }

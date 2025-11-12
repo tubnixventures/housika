@@ -1,7 +1,6 @@
 import crypto from 'crypto';
 import { getCollection } from '../../services/astra.js';
 import { redis } from '../../utils/auth.js';
-import { generateTokenEmail } from '../../utils/tokenEmail.js';
 import { initZeptoMail } from '../../services/zeptoEmail.js';
 
 const USERS_COLLECTION = 'users';
@@ -25,9 +24,6 @@ const forgotPassword = async (c) => {
     let usersCollection;
     try {
       usersCollection = await getCollection(USERS_COLLECTION);
-      if (!usersCollection?.find) {
-        throw new Error('Collection object missing .find() method.');
-      }
       console.log('📦 Connected to collection:', USERS_COLLECTION);
     } catch (err) {
       console.error('❌ DB connection error:', err.message || err);
@@ -42,13 +38,9 @@ const forgotPassword = async (c) => {
     let user;
     try {
       const result = await usersCollection.find({ email: { $eq: normalizedEmail } });
-      const matches = result?.data && typeof result.data === 'object' ? Object.values(result.data) : [];
-      user = matches[0] || null;
-    } catch (queryErr) {
-      console.error('❌ Failed to query user:', queryErr.message || queryErr);
-      if (queryErr.response?.data) {
-        console.error('📄 Astra error response:', JSON.stringify(queryErr.response.data, null, 2));
-      }
+      user = Object.values(result?.data || {})[0] || null;
+    } catch (err) {
+      console.error('❌ Failed to query user:', err.message || err);
       return c.json({
         success: false,
         error: 'DB_QUERY_FAILED',
@@ -73,8 +65,8 @@ const forgotPassword = async (c) => {
     try {
       await redis.set(`reset:${resetToken}`, user.id, { ex: ttl });
       await redis.set(`otp:${normalizedEmail}`, otp, { ex: ttl });
-    } catch (redisErr) {
-      console.error('❌ Redis error:', redisErr.message || redisErr);
+    } catch (err) {
+      console.error('❌ Redis error:', err.message || err);
       return c.json({
         success: false,
         error: 'REDIS_ERROR',
@@ -86,12 +78,89 @@ const forgotPassword = async (c) => {
     const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
     const recipientName = user.fullname || 'User';
 
-    const htmlbody = generateTokenEmail({
-      resetLink,
-      recipientName,
-      brand: 'Housika Properties',
-      otp,
-    });
+    const htmlbody = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+      background-color: #f4f4f4;
+    }
+    .container {
+      max-width: 700px;
+      margin: auto;
+      background-color: #ffffff;
+      padding: 40px;
+      border-radius: 8px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.05);
+    }
+    h2 {
+      color: #b31b1b;
+      margin-bottom: 10px;
+    }
+    p {
+      color: #333333;
+      font-size: 16px;
+      line-height: 1.6;
+    }
+    .otp {
+      font-size: 24px;
+      font-weight: bold;
+      color: #0078D4;
+      margin: 20px 0;
+    }
+    .cta {
+      display: inline-block;
+      margin-top: 20px;
+      padding: 12px 20px;
+      background-color: #0078D4;
+      color: #ffffff;
+      text-decoration: none;
+      border-radius: 4px;
+      font-weight: bold;
+    }
+    .footer {
+      margin-top: 40px;
+      font-size: 13px;
+      color: #777777;
+      text-align: center;
+    }
+    .footer a {
+      color: #b31b1b;
+      text-decoration: none;
+      margin: 0 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Reset Your Housika Password</h2>
+    <p>Dear ${recipientName},</p>
+    <p>We received a request to reset your password. Use the OTP below to verify your identity:</p>
+    <div class="otp">${otp}</div>
+    <p>Or click the button below to reset your password directly:</p>
+    <a href="${resetLink}" class="cta">Reset Password</a>
+    <p>If you did not request this, please ignore this email.</p>
+    <div class="footer">
+      <p>Housika Properties is a technology platform operated under Pansoft Technologies Kenya (BN-36S5WLAP).</p>
+      <p>
+        <a href="mailto:customercare@housika.co.ke">📧 Email</a>
+        <a href="https://wa.me/254785103445">📱 WhatsApp</a>
+        <a href="tel:+254785103445">📞 Call</a>
+        <a href="sms:+254785103445">💬 Message</a>
+        <a href="https://facebook.com/housikaproperties">📘 Facebook</a>
+      </p>
+      <p style="font-size: 12px; color: #999;">This message is confidential and intended for the recipient only.</p>
+    </div>
+  </div>
+</body>
+</html>
+    `;
 
     const zepto = initZeptoMail(process.env);
 
@@ -102,8 +171,8 @@ const forgotPassword = async (c) => {
         htmlbody,
         recipientName,
       });
-    } catch (emailErr) {
-      console.error('❌ Email dispatch failed:', emailErr.message || emailErr);
+    } catch (err) {
+      console.error('❌ Email dispatch failed:', err.message || err);
       return c.json({
         success: false,
         error: 'EMAIL_FAILED',

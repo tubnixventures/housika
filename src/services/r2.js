@@ -1,16 +1,9 @@
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import crypto from 'node:crypto';
 
-let s3 = null;
-let setupError = null;
-let setupPromise = null;
+let s3, setupError, setupPromise;
+let R2_BUCKET, R2_ENDPOINT;
 
-let R2_BUCKET = null;
-let R2_ENDPOINT = null;
-
-/**
- * Internal lazy initializer
- */
 const ensureReady = async () => {
   if (setupError) throw setupError;
   if (s3) return;
@@ -25,7 +18,7 @@ const ensureReady = async () => {
       } = process.env;
 
       if (!R2_SECRET_KEY || !endpoint) {
-        setupError = new Error('❌ Missing R2_SECRET_KEY or R2_ENDPOINT in environment variables.');
+        setupError = new Error('Missing R2_SECRET_KEY or R2_ENDPOINT.');
         return;
       }
 
@@ -47,44 +40,30 @@ const ensureReady = async () => {
   if (setupError) throw setupError;
 };
 
-/**
- * R2 utility methods
- */
 export async function initR2() {
   await ensureReady();
 
-  function generateFilename(extension = 'jpg', prefix = 'uploads') {
-    const id = crypto.randomUUID();
-    return `${prefix}/${id}.${extension}`;
-  }
+  const generateFilename = (ext = 'jpg', prefix = 'uploads') =>
+    `${prefix}/${crypto.randomUUID()}.${ext}`;
 
-  function generatePublicUrl(key) {
-    return `${R2_ENDPOINT}/${R2_BUCKET}/${key}`;
-  }
+  const generatePublicUrl = (key) => `${R2_ENDPOINT}/${R2_BUCKET}/${key}`;
 
-  async function generateUploadUrl(key, contentType = 'image/jpeg') {
-    return `${R2_ENDPOINT}/${R2_BUCKET}/${key}`;
-  }
+  const generateUploadUrl = (key) => `${R2_ENDPOINT}/${R2_BUCKET}/${key}`;
 
-  async function uploadFile(key, buffer, contentType = 'image/jpeg') {
-    const command = new PutObjectCommand({
+  const uploadFile = async (key, buffer, contentType = 'image/jpeg') => {
+    await s3.send(new PutObjectCommand({
       Bucket: R2_BUCKET,
       Key: key,
       Body: buffer,
       ContentType: contentType,
-    });
-    await s3.send(command);
-  }
+    }));
+  };
 
-  async function deleteFile(key) {
-    if (!key) throw new Error('File key is required for deletion.');
-    const command = new DeleteObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: key,
-    });
-    await s3.send(command);
+  const deleteFile = async (key) => {
+    if (!key) throw new Error('File key required.');
+    await s3.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
     return true;
-  }
+  };
 
   return {
     generateFilename,

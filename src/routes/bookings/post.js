@@ -17,12 +17,24 @@ const bookings = async (c) => {
   try {
     body = await c.req.json();
   } catch {
-    return c.json({ success: false, error: 'INVALID_BODY', message: 'Request body must be valid JSON.', traceId, timestamp }, 400);
+    return c.json({
+      success: false,
+      error: 'INVALID_BODY',
+      message: 'Request body must be valid JSON.',
+      traceId,
+      timestamp,
+    }, 400);
   }
 
   const { room_id: roomId, payment_reference } = body;
   if (!roomId || !payment_reference) {
-    return c.json({ success: false, error: 'MISSING_FIELDS', message: 'room_id and payment_reference are required.', traceId, timestamp }, 400);
+    return c.json({
+      success: false,
+      error: 'MISSING_FIELDS',
+      message: 'Both room_id and payment_reference are required.',
+      traceId,
+      timestamp,
+    }, 400);
   }
 
   const token = c.req.header('Authorization')?.replace('Bearer ', '');
@@ -31,7 +43,14 @@ const bookings = async (c) => {
   const isCEO = userPayload?.role === 'ceo';
 
   try {
-    const [roomsCol, propertiesCol, usersCol, bookingsCol, paymentsCol] = await Promise.all([
+    // Step 1: Load all collections in parallel
+    const [
+      roomsCol,
+      propertiesCol,
+      usersCol,
+      bookingsCol,
+      paymentsCol,
+    ] = await Promise.all([
       getCollection('rooms'),
       getCollection('properties'),
       getCollection('users'),
@@ -39,28 +58,48 @@ const bookings = async (c) => {
       getCollection('payments'),
     ]);
 
+    // Step 2: Validate and verify payment if not CEO
     let paymentData = null;
     if (!isCEO) {
       const existing = await paymentsCol.find({ reference: { $eq: payment_reference } });
       const used = Object.values(existing?.data || {})[0];
       if (used?.status === 'used') {
-        return c.json({ success: false, error: 'PAYMENT_USED', message: 'Payment reference already used.', traceId, timestamp }, 409);
+        return c.json({
+          success: false,
+          error: 'PAYMENT_USED',
+          message: 'This payment reference has already been used.',
+          traceId,
+          timestamp,
+        }, 409);
       }
 
       try {
         const verified = await verifyPayment(payment_reference);
         paymentData = verified?.data;
         if (!paymentData || paymentData.status !== 'success') {
-          return c.json({ success: false, error: 'PAYMENT_FAILED', message: 'Payment verification failed.', traceId, timestamp }, 402);
+          return c.json({
+            success: false,
+            error: 'PAYMENT_FAILED',
+            message: 'Payment verification was unsuccessful.',
+            traceId,
+            timestamp,
+          }, 402);
         }
       } catch (err) {
         if (err.message?.includes('Transaction reference not found')) {
-          return c.json({ success: false, error: 'PAYMENT_REFERENCE_NOT_FOUND', message: 'Invalid payment reference.', traceId, timestamp }, 402);
+          return c.json({
+            success: false,
+            error: 'PAYMENT_REFERENCE_NOT_FOUND',
+            message: 'Provided payment reference is invalid.',
+            traceId,
+            timestamp,
+          }, 402);
         }
         throw err;
       }
     }
 
+    // Step 3: Fetch room, property, landlord
     const [roomDoc, propertyDoc] = await Promise.all([
       roomsCol.find({ room_id: { $eq: roomId } }),
       propertiesCol.find({ property_id: { $eq: roomId.split('-')[0] } }),
@@ -68,20 +107,28 @@ const bookings = async (c) => {
     const room = Object.values(roomDoc?.data || {})[0];
     const property = Object.values(propertyDoc?.data || {})[0];
     if (!room || !property) {
-      return c.json({ success: false, error: 'ROOM_OR_PROPERTY_NOT_FOUND', message: 'Room or property not found.', traceId, timestamp }, 404);
+      return c.json({
+        success: false,
+        error: 'ROOM_OR_PROPERTY_NOT_FOUND',
+        message: 'Room or property could not be located.',
+        traceId,
+        timestamp,
+      }, 404);
     }
 
     const landlordDoc = await usersCol.find({ user_id: { $eq: property.landlord_id } });
     const landlord = Object.values(landlordDoc?.data || {})[0];
     if (!landlord) {
-      return c.json({ success: false, error: 'LANDLORD_NOT_FOUND', message: 'Landlord not found.', traceId, timestamp }, 404);
+      return c.json({
+        success: false,
+        error: 'LANDLORD_NOT_FOUND',
+        message: 'Associated landlord record is missing.',
+        traceId,
+        timestamp,
+      }, 404);
     }
 
-    await Promise.all([
-      roomsCol.patch(room._id, { status: 'inactive' }),
-      propertiesCol.patch(property._id, { unit_available: (property.unit_available || 1) - 1 }),
-    ]);
-
+    // Step 4: Construct booking object
     const receiptId = uuid();
     const booking = {
       booking_id: uuid(),
@@ -116,27 +163,39 @@ const bookings = async (c) => {
     } else {
       const { full_name, phone_number, national_id, from, email } = body;
       if (!full_name || !phone_number || !national_id || !from || !email) {
-        return c.json({ success: false, error: 'MISSING_GUEST_FIELDS', message: 'Guest fields are required.', traceId, timestamp }, 400);
+        return c.json({
+          success: false,
+          error: 'MISSING_GUEST_FIELDS',
+          message: 'Guest details are incomplete.',
+          traceId,
+          timestamp,
+        }, 400);
       }
       booking.guest = { full_name, phone_number, national_id, from };
       tenantEmail = email;
       tenantName = full_name;
     }
 
+    // Step 5: Generate receipt (QR + PDF) in parallel
     const verifyUrl = `https://housika.co.ke/verify-receipt/${receiptId}`;
-    const qrDataUrl = await QRCode.toDataURL(verifyUrl);
-    const receiptHtml = `...`; // Replace with actual HTML template
-    const pdfBuffer = await htmlToPdfBuffer(receiptHtml);
+    const [qrDataUrl, pdfBuffer] = await Promise.all([
+      QRCode.toDataURL(verifyUrl),
+      htmlToPdfBuffer(`...`), // Replace with actual HTML template
+    ]);
 
+    // Step 6: Upload receipt to R2
     const r2 = initR2();
     const receiptKey = `receipts/${receiptId}.pdf`;
     await r2.uploadFile(receiptKey, pdfBuffer, 'application/pdf');
     booking.receipt_url = r2.generatePublicUrl(receiptKey);
     booking.receipt_sent = true;
 
-    const ops = [bookingsCol.post(booking)];
-    if (!isCEO && paymentData) {
-      ops.push(paymentsCol.post({
+    // Step 7: Persist booking and update state
+    await Promise.all([
+      roomsCol.patch(room._id, { status: 'inactive' }),
+      propertiesCol.patch(property._id, { unit_available: (property.unit_available || 1) - 1 }),
+      bookingsCol.post(booking),
+      !isCEO && paymentData && paymentsCol.post({
         reference: payment_reference,
         status: 'used',
         verified_at: timestamp,
@@ -144,10 +203,10 @@ const bookings = async (c) => {
         currency: paymentData.currency,
         email: paymentData.customer?.email,
         metadata: paymentData.metadata || {},
-      }));
-    }
-    await Promise.all(ops);
+      }),
+    ].filter(Boolean));
 
+    // Step 8: Fire-and-forget email dispatch
     (async () => {
       try {
         const zepto = initZeptoMail(c.env);

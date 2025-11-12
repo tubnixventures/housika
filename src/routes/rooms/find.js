@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { getCollection } from '../../services/astra.js';
 
 /**
@@ -7,37 +8,40 @@ import { getCollection } from '../../services/astra.js';
  */
 const find = async (c) => {
   const timestamp = new Date().toISOString();
-  let filters;
+  const traceId = c.req.header('x-trace-id') || crypto.randomUUID();
 
+  let filters;
   try {
     filters = await c.req.json();
-    if (!filters || typeof filters !== 'object') {
-      throw new Error('Request body must be valid JSON.');
-    }
+    if (!filters || typeof filters !== 'object') throw new Error('Invalid JSON');
   } catch (err) {
-    console.error('❌ Filter parse error:', err.message || err);
     return c.json({
       success: false,
       error: 'INVALID_FILTERS',
       message: 'Request body must be valid JSON.',
       timestamp,
+      traceId,
     }, 400);
   }
 
-  let propertiesCol, roomsCol;
-  try {
-    [propertiesCol, roomsCol] = await Promise.all([
-      getCollection('properties'),
-      getCollection('rooms'),
-    ]);
-    console.log('📦 Connected to collections: properties, rooms');
-  } catch (err) {
-    console.error('❌ DB connection error:', err.message || err);
+  const [propertiesResult, roomsResult] = await Promise.allSettled([
+    getCollection('properties'),
+    getCollection('rooms'),
+  ]);
+
+  const propertiesCol = propertiesResult.status === 'fulfilled' ? propertiesResult.value : null;
+  const roomsCol = roomsResult.status === 'fulfilled' ? roomsResult.value : null;
+
+  if (!propertiesCol || !roomsCol) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ DB connection failed:', propertiesResult.reason || roomsResult.reason);
+    }
     return c.json({
       success: false,
       error: 'DB_CONNECTION_FAILED',
       message: 'Database connection failed.',
       timestamp,
+      traceId,
     }, 503);
   }
 
@@ -59,7 +63,6 @@ const find = async (c) => {
   if (filters.period) roomQuery.period = { $eq: filters.period };
   if (filters.category) roomQuery.category = { $eq: filters.category };
 
-  const linkByPropertyId = filters.linked === true;
   let matchedProperties = [];
   let matchedRooms = [];
 
@@ -70,29 +73,26 @@ const find = async (c) => {
     ]);
     matchedProperties = Object.values(propertyResult?.data || {});
     matchedRooms = Object.values(roomResult?.data || {});
-  } catch (queryErr) {
-    console.error('❌ Query execution failed:', queryErr.message || queryErr);
-    if (queryErr.response?.data) {
-      console.error('📄 Astra error response:', JSON.stringify(queryErr.response.data, null, 2));
+  } catch (err) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('❌ Query execution failed:', err.message || err);
     }
     return c.json({
       success: false,
       error: 'QUERY_FAILED',
       message: 'Failed to execute search queries.',
       timestamp,
+      traceId,
     }, 500);
   }
 
-  let enrichedRooms = matchedRooms;
-  if (linkByPropertyId) {
-    const propertyMap = Object.fromEntries(
-      matchedProperties.map((p) => [p.property_id, p])
-    );
-    enrichedRooms = matchedRooms.map((room) => ({
-      ...room,
-      property: propertyMap[room.propertyId] || null,
-    }));
-  }
+  const linkByPropertyId = filters.linked === true;
+  const enrichedRooms = linkByPropertyId
+    ? matchedRooms.map((room) => ({
+        ...room,
+        property: matchedProperties.find((p) => p.property_id === room.propertyId) || null,
+      }))
+    : matchedRooms;
 
   return c.json({
     success: true,
@@ -106,7 +106,8 @@ const find = async (c) => {
       rooms: enrichedRooms,
     },
     timestamp,
-  });
+    traceId,
+  }, 200);
 };
 
 export default find;
