@@ -1,29 +1,15 @@
 import { Hono } from 'hono';
-import postReceipt from './post.js';
-import verifyReceipt from './verify.js';
-import listReceipts from './list.js';
-import getReceiptById from './mine/[receipt_id].js';
+import verify  from './verify.js';
+import  receipts  from './post.js';
+import list from './list.js';
+import mine from './mine/[receipt_id].js';
 
-const receiptRoutes = new Hono();
 
-/**
- * Public route to verify a receipt by ID
- */
-receiptRoutes.get('/verify/:receipt_id', verifyReceipt);
+const rooms = new Hono();
 
-/**
- * Protected route to create a custom receipt (landlord or dual only)
- */
-receiptRoutes.post('/', postReceipt);
-
-/**
- * Protected route to list all receipts created by the authenticated landlord
- */
-receiptRoutes.get('/mine', listReceipts);
-
-/**
- * Protected route to fetch a specific receipt created by the authenticated landlord
- */
-receiptRoutes.get('/mine/:receipt_id', getReceiptById);
+rooms.get('/verify', verify);                  
+rooms.put('/:id', mine); 
+rooms.delete('/list', list);
+rooms.post('/', receipts); 
 
 export default receiptRoutes;

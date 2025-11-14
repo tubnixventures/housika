@@ -1,11 +1,11 @@
+// update.js
 import crypto from 'crypto';
 import { getCollection } from '../../services/astra.js';
 import { checkToken } from '../../utils/auth.js';
 
 /**
  * PUT /bookings/:id
- * Allows landlord to update booking status or extend stay.
- * Only the landlord of the booking can perform this update.
+ * Allows landlord or admin/ceo to update booking status or extend stay.
  */
 export const updateBooking = async (c) => {
   const timestamp = new Date().toISOString();
@@ -23,6 +23,7 @@ export const updateBooking = async (c) => {
     }, 401);
   }
 
+  // Resolve token and bookings collection in parallel
   const [actorResult, collectionResult] = await Promise.allSettled([
     checkToken(token),
     getCollection('bookings'),
@@ -94,24 +95,30 @@ export const updateBooking = async (c) => {
     }, 500);
   }
 
-  if (booking.landlord_id !== actor.userId) {
+  // Authorization: landlord of the booking OR admin/ceo allowed
+  const isActorLandlord = booking.landlord_id === actor.userId;
+  const isActorAdmin = ['admin', 'ceo'].includes(actor.role || actor?.role || '');
+  if (!isActorLandlord && !isActorAdmin) {
     return c.json({
       success: false,
       error: 'FORBIDDEN',
-      message: 'Only the landlord of this booking can update it.',
+      message: 'Only the landlord or an admin can update this booking.',
       timestamp,
       traceId,
     }, 403);
   }
 
-  const allowedFields = ['status', 'new_checkout_date', 'notes'];
-  const updatePayload = Object.fromEntries(
-    allowedFields
-      .filter((key) => Object.prototype.hasOwnProperty.call(updateData, key))
-      .map((key) => [key, updateData[key]])
-  );
+  // Allowed incoming fields (accept both new_checkout_date and end_date/start_date)
+  const allowedInputKeys = ['status', 'new_checkout_date', 'start_date', 'end_date', 'notes'];
+  const sanitized = {};
 
-  if (Object.keys(updatePayload).length === 0) {
+  for (const key of allowedInputKeys) {
+    if (Object.prototype.hasOwnProperty.call(updateData, key)) {
+      sanitized[key] = updateData[key];
+    }
+  }
+
+  if (Object.keys(sanitized).length === 0) {
     return c.json({
       success: false,
       error: 'NO_VALID_FIELDS',
@@ -121,6 +128,19 @@ export const updateBooking = async (c) => {
     }, 400);
   }
 
+  // Map/normalize fields to stored keys
+  const updatePayload = {};
+  if (sanitized.status) updatePayload.status = String(sanitized.status);
+  // Prefer explicit start_date/end_date; if not present, leave unchanged
+  if (sanitized.start_date) updatePayload.start_date = String(sanitized.start_date);
+  if (sanitized.end_date) updatePayload.end_date = String(sanitized.end_date);
+  // Accept legacy/alternate name new_checkout_date and store as end_date
+  if (sanitized.new_checkout_date && !updatePayload.end_date) {
+    updatePayload.end_date = String(sanitized.new_checkout_date);
+  }
+  if (sanitized.notes) updatePayload.notes = sanitized.notes;
+
+  // Audit fields
   updatePayload.updated_by = actor.userId;
   updatePayload.updated_at = timestamp;
   updatePayload.audit_ip = c.req.header('x-forwarded-for') || '';
@@ -129,6 +149,7 @@ export const updateBooking = async (c) => {
 
   try {
     await bookingsCol.patch(booking._id, updatePayload);
+
     return c.json({
       success: true,
       message: 'Booking updated successfully.',
