@@ -1,120 +1,237 @@
-import { getCollection } from '../../services/astra.js'
+// src/routes/properties/getProperties.js
+import { getCollection } from '../../services/astra.js';
 
 /**
  * GET /properties
+ * Improved: server-side pagination + projection + optional  short-term in-memory cache
+ *
  * Query params:
- * - page (default 1)
- * - limit (default 12)
- * - q (optional search term for title or location)
- * - sort (optional, e.g. "-createdAt" or "createdAt")
+ *  - page (default 1)
+ *  - limit (default 12, max 100)
+ *  - q (optional search term applying to title or location)
+ *  - sort (optional, e.g. "-createdAt" or "createdAt")
  *
  * Response:
- * {
- *   success: true,
- *   data: { data: [...properties], total, page, limit, sorted: boolean }
- * }
- *
- * Notes:
- * - This handler prefers server-side filtering and sorting where possible.
- * - When the underlying collection driver cannot provide efficient skip/offset,
- *   this implementation will fetch the matching set and slice it for paging.
- *   For large datasets you should replace the slice logic with an indexed
- *   query that supports offset/limit on the DB side.
+ *  { success: true, data: [...], total, page, limit, timestamp }
  */
+
+// In-process short-lived cache for identical queries (TTL in ms).
+// Useful for hot endpoints behind a load-balanced single-process instance or during quick retries.
+// Keep small and short TTL to avoid stale data; remove if you have a shared cache like Redis.
+const CACHE_TTL = 5000; // 5 seconds
+const CACHE_MAX = 200;
+const queryCache = new Map(); // key -> { ts, value }
+
+const makeCacheKey = (obj) => JSON.stringify(obj);
+
+const cleanupCache = () => {
+  if (queryCache.size <= CACHE_MAX) return;
+  const keys = Array.from(queryCache.keys());
+  // remove oldest entries
+  for (let i = 0; i < Math.floor(keys.length / 4); i += 1) {
+    queryCache.delete(keys[i]);
+    if (queryCache.size <= CACHE_MAX) break;
+  }
+};
+
 export const getProperties = async (c) => {
-  const timestamp = new Date().toISOString()
+  const started = Date.now();
+  const timestamp = new Date().toISOString();
 
-  // parse and normalize query params
-  const pageRaw = Number(c.req.query('page') || 1)
-  const limitRaw = Number(c.req.query('limit') || 12)
-  const q = (c.req.query('q') || '').trim()
-  const sort = (c.req.query('sort') || '').trim() // e.g. "-createdAt" or "createdAt"
+  // Parse and validate query params
+  const rawPage = Number(c.req.query('page') || 1);
+  const rawLimit = Number(c.req.query('limit') || 12);
+  const q = (c.req.query('q') || '').trim();
+  const sort = (c.req.query('sort') || '').trim(); // "-createdAt" or "createdAt"
 
-  const page = Number.isFinite(pageRaw) && pageRaw > 0 ? Math.floor(pageRaw) : 1
-  const limit = Number.isFinite(limitRaw) && limitRaw > 0 && limitRaw <= 500 ? Math.floor(limitRaw) : 12
+  const page = Number.isFinite(rawPage) && rawPage > 0 ? Math.floor(rawPage) : 1;
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0
+    ? Math.min(Math.floor(rawLimit), 100)
+    : 12;
 
-  // Build a filter object compatible with Astra collection find
-  // We support a simple case-insensitive 'contains' search on title or location.
-  const hasQuery = Boolean(q)
-  let filter = {}
-  if (hasQuery) {
-    // Many Astra wrappers accept $or with regex; if yours doesn't, replace with appropriate full-text filter
-    filter = {
-      $or: [
-        { title: { $regex: q, $options: 'i' } },
-        { location: { $regex: q, $options: 'i' } },
-      ],
-    }
+  // Build filter: prefer server-side full-text or regex on indexed fields
+  const filter = {};
+  if (q) {
+    // Prefer a text-search-capable backend. If Astra supports $text use it; otherwise fallback to case-insensitive regex.
+    // Try $text first (uncomment if supported), otherwise use regex.
+    // filter.$text = { $search: q };
+
+    const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // escape regex chars
+    filter.$or = [
+      { title: { $regex: safeQ, $options: 'i' } },
+      { location: { $regex: safeQ, $options: 'i' } },
+    ];
   }
 
-  let propertiesCol
+  // Projection: return only necessary fields (keeps payload small)
+  const projection = {
+    receipt_id: 0, // irrelevant for properties, example of excluding fields; adapt to your schema
+    // include: id, title, price, location, photos[0], createdAt, slug, short description
+    // For Astra wrapper, projection may be { fields: ['id','title', ...] } - adapt if required
+  };
+
+  // Compute sort object: prefer server-side sort on createdAt
+  let sortObj = { createdAt: -1 }; // default: newest first
+  if (sort) {
+    const desc = sort.startsWith('-');
+    const key = desc ? sort.slice(1) : sort;
+    sortObj = { [key]: desc ? -1 : 1 };
+  }
+
+  // Query key for short-term cache
+  const cacheKey = makeCacheKey({ page, limit, q, sort });
+  const now = Date.now();
+  const cached = queryCache.get(cacheKey);
+  if (cached && now - cached.ts < CACHE_TTL) {
+    // Return cached copy (fast-path)
+    return c.json({
+      success: true,
+      data: cached.value.data,
+      total: cached.value.total,
+      page,
+      limit,
+      cached: true,
+      durationMs: Date.now() - started,
+      timestamp,
+    }, 200);
+  }
+
+  // Connect to collection
+  let propertiesCol;
   try {
-    propertiesCol = await getCollection('properties')
+    propertiesCol = await getCollection('properties');
   } catch (err) {
-    console.error('❌ DB connection error:', err?.message || err)
+    console.error('❌ DB connection error:', err?.message || err);
     return c.json({
       success: false,
       error: 'DB_CONNECTION_FAILED',
       message: 'Database connection failed.',
       timestamp,
-    }, 503)
+    }, 503);
   }
 
   try {
-    // Try to perform server-side find with optional sort and limit/offset if supported.
-    // Many collection APIs accept an options object; adapt this as needed for your driver.
-    const sortField = sort ? (sort.startsWith('-') ? { [sort.slice(1)]: -1 } : { [sort]: 1 }) : null
+    // Attempt server-side paginated query using limit + offset/skip if the driver supports it.
+    // Many Astra wrappers accept options: { limit, offset, sort, projection }
+    const options = {
+      limit,
+      offset: (page - 1) * limit,
+      sort: sortObj,
+      projection: projection, // adapt key depending on your driver
+    };
 
-    // Attempt a server-side call that returns all matches; then we'll slice for paging if driver lacks offset.
-    // This keeps behavior consistent across different drivers.
-    const findOptions = {}
-    if (sortField) findOptions.sort = sortField
+    // Primary attempt: server-side paged find
+    const raw = await propertiesCol.find(filter, options);
 
-    const raw = await propertiesCol.find(filter, findOptions)
-    // raw.data shape: object map keyed by document id in Astra wrapper; convert to array
-    let list = Array.isArray(raw?.data) ? raw.data : Object.values(raw?.data || {})
+    // raw.data shape: array or object map depending on wrapper; normalize to array
+    let rows = Array.isArray(raw?.data) ? raw.data : Object.values(raw?.data || {});
 
-    // ensure createdAt exists and coerce to Date for sorting fallback
-    list = list.map((item) => ({
-      ...item,
-      createdAt: item.createdAt || item.created_at || item.createdAtISO || null,
-    }))
+    // If driver returns partial documents, map to sanitized shape and lightweight fields
+    const data = rows.map((item) => ({
+      id: item.id || item.property_id || item._id || null,
+      title: item.title || null,
+      price: item.price || null,
+      currency: item.price_currency || item.currency || null,
+      location: item.location || null,
+      thumbnail: (item.photos && item.photos[0]) || item.thumbnail || null,
+      createdAt: item.createdAt || item.created_at || null,
+      slug: item.slug || null,
+      shortDescription: item.shortDescription || item.description || null,
+    }));
 
-    // If sort param provided but driver didn't sort (we can't reliably detect), do client-side sort fallback
-    if (sort) {
-      const desc = sort.startsWith('-')
-      const key = desc ? sort.slice(1) : sort
-      list.sort((a, b) => {
-        const va = a[key] ? new Date(a[key]).getTime() : 0
-        const vb = b[key] ? new Date(b[key]).getTime() : 0
-        return desc ? vb - va : va - vb
-      })
-    } else {
-      // default: most recent first (createdAt)
-      list.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+    // Attempt to get total count: some drivers return total in raw.total or raw.count
+    const total = typeof raw?.total === 'number' ? raw.total
+      : typeof raw?.count === 'number' ? raw.count
+      : // Fallback: if driver didn't provide count, do a cheap count query if supported
+      null;
+
+    // If total is null and driver doesn't support count, try a separate count call (may be slower)
+    let finalTotal = total;
+    if (finalTotal === null && typeof propertiesCol.count === 'function') {
+      try {
+        finalTotal = await propertiesCol.count(filter);
+      } catch (countErr) {
+        // If counting is expensive/unavailable, set to data.length + offset as approximate
+        finalTotal = (page - 1) * limit + data.length;
+      }
+    } else if (finalTotal === null) {
+      finalTotal = (page - 1) * limit + data.length;
     }
 
-    const total = list.length
-    const start = (page - 1) * limit
-    const end = start + limit
-    const pageSlice = list.slice(start, end)
+    // Cache the result (short TTL)
+    queryCache.set(cacheKey, { ts: now, value: { data, total: finalTotal } });
+    cleanupCache();
 
     return c.json({
       success: true,
-      data: pageSlice,
-      total,
+      data,
+      total: finalTotal,
       page,
       limit,
-      sorted: Boolean(sort || true), // server returns sorted list (we ensure sorting above)
+      cached: false,
+      durationMs: Date.now() - started,
       timestamp,
-    }, 200)
+    }, 200);
   } catch (err) {
-    console.error('❌ getProperties failed:', err?.message || err)
-    return c.json({
-      success: false,
-      error: 'QUERY_FAILED',
-      message: 'Failed to fetch properties.',
-      timestamp,
-    }, 500)
+    // Fallback: if server-side paging not supported, do efficient limited fetch then slice
+    console.warn('Primary paged query failed, falling back to safe fetch:', err?.message || err);
+    try {
+      const rawAll = await propertiesCol.find(filter);
+      let all = Array.isArray(rawAll?.data) ? rawAll.data : Object.values(rawAll?.data || {});
+      // lightweight mapping
+      all = all.map((item) => ({
+        id: item.id || item.property_id || item._id || null,
+        title: item.title || null,
+        price: item.price || null,
+        currency: item.price_currency || item.currency || null,
+        location: item.location || null,
+        thumbnail: (item.photos && item.photos[0]) || item.thumbnail || null,
+        createdAt: item.createdAt || item.created_at || null,
+        slug: item.slug || null,
+        shortDescription: item.shortDescription || item.description || null,
+      }));
+
+      // client-side sort fallback
+      if (sort) {
+        const desc = sort.startsWith('-');
+        const key = desc ? sort.slice(1) : sort;
+        all.sort((a, b) => {
+          const va = a[key] ? new Date(a[key]).getTime() : 0;
+          const vb = b[key] ? new Date(b[key]).getTime() : 0;
+          return desc ? vb - va : va - vb;
+        });
+      } else {
+        all.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+      }
+
+      const total = all.length;
+      const start = (page - 1) * limit;
+      const pageSlice = all.slice(start, start + limit);
+
+      // Cache fallback result briefly
+      queryCache.set(cacheKey, { ts: now, value: { data: pageSlice, total } });
+      cleanupCache();
+
+      return c.json({
+        success: true,
+        data: pageSlice,
+        total,
+        page,
+        limit,
+        cached: false,
+        durationMs: Date.now() - started,
+        timestamp,
+      }, 200);
+    } catch (finalErr) {
+      console.error('❌ getProperties final fallback failed:', finalErr?.message || finalErr);
+      return c.json({
+        success: false,
+        error: 'QUERY_FAILED',
+        message: 'Failed to fetch properties.',
+        timestamp,
+      }, 500);
+    }
   }
-}
+};
+
+export default getProperties;
