@@ -1,93 +1,81 @@
-// src/routes/properties/getProperties.js
 import { getCollection } from '../../services/astra.js';
+import { redis as upstashRedis } from '../../utils/auth.js';
 
-/**
- * GET /properties
- * Improved: server-side pagination + projection + optional  short-term in-memory cache
- *
- * Query params:
- *  - page (default 1)
- *  - limit (default 12, max 100)
- *  - q (optional search term applying to title or location)
- *  - sort (optional, e.g. "-createdAt" or "createdAt")
- *
- * Response:
- *  { success: true, data: [...], total, page, limit, timestamp }
- */
+const CACHE_TTL_SEC = Number(process.env.CACHE_TTL_SEC || 15); // short TTL by default
+const CACHE_KEY_PREFIX = process.env.CACHE_KEY_PREFIX || 'cache';
+const INMEM_TTL_MS = 5000; // per-worker short cache for hot queries
+const INMEM_MAX = 300;
+const inMemCache = new Map(); // key -> { ts, value }
 
-// In-process short-lived cache for identical queries (TTL in ms).
-// Useful for hot endpoints behind a load-balanced single-process instance or during quick retries.
-// Keep small and short TTL to avoid stale data; remove if you have a shared cache like Redis.
-const CACHE_TTL = 5000; // 5 seconds
-const CACHE_MAX = 200;
-const queryCache = new Map(); // key -> { ts, value }
-
-const makeCacheKey = (obj) => JSON.stringify(obj);
-
-const cleanupCache = () => {
-  if (queryCache.size <= CACHE_MAX) return;
-  const keys = Array.from(queryCache.keys());
-  // remove oldest entries
+// helpers
+const makeCacheKey = ({ page, limit, q, sort }) => `${CACHE_KEY_PREFIX}:properties:${page}:${limit}:${encodeURIComponent(q || '')}:${sort || ''}`;
+const cleanupInMem = () => {
+  if (inMemCache.size <= INMEM_MAX) return;
+  const keys = Array.from(inMemCache.keys()).sort((a, b) => inMemCache.get(a).ts - inMemCache.get(b).ts);
   for (let i = 0; i < Math.floor(keys.length / 4); i += 1) {
-    queryCache.delete(keys[i]);
-    if (queryCache.size <= CACHE_MAX) break;
+    inMemCache.delete(keys[i]);
+    if (inMemCache.size <= INMEM_MAX) break;
+  }
+};
+const inMemGet = (k) => {
+  const e = inMemCache.get(k);
+  if (!e) return null;
+  if (Date.now() - e.ts > INMEM_TTL_MS) {
+    inMemCache.delete(k);
+    return null;
+  }
+  return e.value;
+};
+const inMemSet = (k, v) => {
+  inMemCache.set(k, { ts: Date.now(), value: v });
+  cleanupInMem();
+};
+
+const redisGet = async (key) => {
+  try {
+    const raw = await upstashRedis.get(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn('Redis get error (properties):', e?.message || e);
+    return null;
+  }
+};
+const redisSet = async (key, payload, ttlSec = CACHE_TTL_SEC) => {
+  try {
+    await upstashRedis.set(key, JSON.stringify(payload));
+    if (typeof upstashRedis.expire === 'function') {
+      await upstashRedis.expire(key, ttlSec);
+    }
+  } catch (e) {
+    console.warn('Redis set error (properties):', e?.message || e);
   }
 };
 
+// Main handler
 export const getProperties = async (c) => {
   const started = Date.now();
   const timestamp = new Date().toISOString();
 
-  // Parse and validate query params
   const rawPage = Number(c.req.query('page') || 1);
   const rawLimit = Number(c.req.query('limit') || 12);
   const q = (c.req.query('q') || '').trim();
-  const sort = (c.req.query('sort') || '').trim(); // "-createdAt" or "createdAt"
+  const sort = (c.req.query('sort') || '').trim();
 
   const page = Number.isFinite(rawPage) && rawPage > 0 ? Math.floor(rawPage) : 1;
-  const limit = Number.isFinite(rawLimit) && rawLimit > 0
-    ? Math.min(Math.floor(rawLimit), 100)
-    : 12;
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 100) : 12;
 
-  // Build filter: prefer server-side full-text or regex on indexed fields
-  const filter = {};
-  if (q) {
-    // Prefer a text-search-capable backend. If Astra supports $text use it; otherwise fallback to case-insensitive regex.
-    // Try $text first (uncomment if supported), otherwise use regex.
-    // filter.$text = { $search: q };
-
-    const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // escape regex chars
-    filter.$or = [
-      { title: { $regex: safeQ, $options: 'i' } },
-      { location: { $regex: safeQ, $options: 'i' } },
-    ];
-  }
-
-  // Projection: return only necessary fields (keeps payload small)
-  const projection = {
-    receipt_id: 0, // irrelevant for properties, example of excluding fields; adapt to your schema
-    // include: id, title, price, location, photos[0], createdAt, slug, short description
-    // For Astra wrapper, projection may be { fields: ['id','title', ...] } - adapt if required
-  };
-
-  // Compute sort object: prefer server-side sort on createdAt
-  let sortObj = { createdAt: -1 }; // default: newest first
-  if (sort) {
-    const desc = sort.startsWith('-');
-    const key = desc ? sort.slice(1) : sort;
-    sortObj = { [key]: desc ? -1 : 1 };
-  }
-
-  // Query key for short-term cache
   const cacheKey = makeCacheKey({ page, limit, q, sort });
-  const now = Date.now();
-  const cached = queryCache.get(cacheKey);
-  if (cached && now - cached.ts < CACHE_TTL) {
-    // Return cached copy (fast-path)
+
+  // 1) Try Redis
+  const rCached = await redisGet(cacheKey);
+  if (rCached != null) {
+    c.header('X-Cache', 'HIT-REDIS');
+    c.set('cachePayload', rCached.data);
     return c.json({
       success: true,
-      data: cached.value.data,
-      total: cached.value.total,
+      data: rCached.data,
+      total: rCached.total,
       page,
       limit,
       cached: true,
@@ -96,12 +84,53 @@ export const getProperties = async (c) => {
     }, 200);
   }
 
+  // 2) Try in-memory
+  const mem = inMemGet(cacheKey);
+  if (mem != null) {
+    c.header('X-Cache', 'HIT-MEM');
+    c.set('cachePayload', mem.data);
+    return c.json({
+      success: true,
+      data: mem.data,
+      total: mem.total,
+      page,
+      limit,
+      cached: true,
+      durationMs: Date.now() - started,
+      timestamp,
+    }, 200);
+  }
+
+  // Build filter and sort
+  const filter = {};
+  if (q) {
+    const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    filter.$or = [
+      { title: { $regex: safeQ, $options: 'i' } },
+      { location: { $regex: safeQ, $options: 'i' } },
+    ];
+  }
+  let sortObj = { createdAt: -1 };
+  if (sort) {
+    const desc = sort.startsWith('-');
+    const key = desc ? sort.slice(1) : sort;
+    sortObj = { [key]: desc ? -1 : 1 };
+  }
+
+  // Projection: return minimal fields for list
+  const projection = {
+    // adapt to your Astra driver projection format; this example assumes exclusion by keys
+    receipt_id: 0,
+    fullDescription: 0,
+    largePhotos: 0,
+  };
+
   // Connect to collection
   let propertiesCol;
   try {
     propertiesCol = await getCollection('properties');
   } catch (err) {
-    console.error('❌ DB connection error:', err?.message || err);
+    console.error('DB connection error (properties):', err?.message || err);
     return c.json({
       success: false,
       error: 'DB_CONNECTION_FAILED',
@@ -110,23 +139,17 @@ export const getProperties = async (c) => {
     }, 503);
   }
 
+  // Attempt server-side paged query
   try {
-    // Attempt server-side paginated query using limit + offset/skip if the driver supports it.
-    // Many Astra wrappers accept options: { limit, offset, sort, projection }
     const options = {
       limit,
       offset: (page - 1) * limit,
       sort: sortObj,
-      projection: projection, // adapt key depending on your driver
+      projection,
     };
-
-    // Primary attempt: server-side paged find
     const raw = await propertiesCol.find(filter, options);
-
-    // raw.data shape: array or object map depending on wrapper; normalize to array
     let rows = Array.isArray(raw?.data) ? raw.data : Object.values(raw?.data || {});
 
-    // If driver returns partial documents, map to sanitized shape and lightweight fields
     const data = rows.map((item) => ({
       id: item.id || item.property_id || item._id || null,
       title: item.title || null,
@@ -139,33 +162,32 @@ export const getProperties = async (c) => {
       shortDescription: item.shortDescription || item.description || null,
     }));
 
-    // Attempt to get total count: some drivers return total in raw.total or raw.count
-    const total = typeof raw?.total === 'number' ? raw.total
+    let total = typeof raw?.total === 'number' ? raw.total
       : typeof raw?.count === 'number' ? raw.count
-      : // Fallback: if driver didn't provide count, do a cheap count query if supported
-      null;
+      : null;
 
-    // If total is null and driver doesn't support count, try a separate count call (may be slower)
-    let finalTotal = total;
-    if (finalTotal === null && typeof propertiesCol.count === 'function') {
+    if (total === null && typeof propertiesCol.count === 'function') {
       try {
-        finalTotal = await propertiesCol.count(filter);
+        total = await propertiesCol.count(filter);
       } catch (countErr) {
-        // If counting is expensive/unavailable, set to data.length + offset as approximate
-        finalTotal = (page - 1) * limit + data.length;
+        total = (page - 1) * limit + data.length;
       }
-    } else if (finalTotal === null) {
-      finalTotal = (page - 1) * limit + data.length;
+    } else if (total === null) {
+      total = (page - 1) * limit + data.length;
     }
 
-    // Cache the result (short TTL)
-    queryCache.set(cacheKey, { ts: now, value: { data, total: finalTotal } });
-    cleanupCache();
+    const payload = { data, total };
 
+    // cache best-effort
+    inMemSet(cacheKey, payload);
+    await redisSet(cacheKey, payload, CACHE_TTL_SEC);
+
+    c.set('cachePayload', data);
+    c.header('X-Cache', 'MISS');
     return c.json({
       success: true,
       data,
-      total: finalTotal,
+      total,
       page,
       limit,
       cached: false,
@@ -173,13 +195,13 @@ export const getProperties = async (c) => {
       timestamp,
     }, 200);
   } catch (err) {
-    // Fallback: if server-side paging not supported, do efficient limited fetch then slice
-    console.warn('Primary paged query failed, falling back to safe fetch:', err?.message || err);
+    // fallback: fetch all, map, sort, slice
+    console.warn('Primary paged query failed, falling back:', err?.message || err);
     try {
       const rawAll = await propertiesCol.find(filter);
       let all = Array.isArray(rawAll?.data) ? rawAll.data : Object.values(rawAll?.data || {});
-      // lightweight mapping
-      all = all.map((item) => ({
+
+      const mapped = all.map((item) => ({
         id: item.id || item.property_id || item._id || null,
         title: item.title || null,
         price: item.price || null,
@@ -191,27 +213,29 @@ export const getProperties = async (c) => {
         shortDescription: item.shortDescription || item.description || null,
       }));
 
-      // client-side sort fallback
+      // client-side sort
       if (sort) {
         const desc = sort.startsWith('-');
         const key = desc ? sort.slice(1) : sort;
-        all.sort((a, b) => {
+        mapped.sort((a, b) => {
           const va = a[key] ? new Date(a[key]).getTime() : 0;
           const vb = b[key] ? new Date(b[key]).getTime() : 0;
           return desc ? vb - va : va - vb;
         });
       } else {
-        all.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+        mapped.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
       }
 
-      const total = all.length;
+      const total = mapped.length;
       const start = (page - 1) * limit;
-      const pageSlice = all.slice(start, start + limit);
+      const pageSlice = mapped.slice(start, start + limit);
 
-      // Cache fallback result briefly
-      queryCache.set(cacheKey, { ts: now, value: { data: pageSlice, total } });
-      cleanupCache();
+      const payload = { data: pageSlice, total };
+      inMemSet(cacheKey, payload);
+      await redisSet(cacheKey, payload, CACHE_TTL_SEC);
 
+      c.set('cachePayload', pageSlice);
+      c.header('X-Cache', 'MISS-FALLBACK');
       return c.json({
         success: true,
         data: pageSlice,
@@ -223,7 +247,7 @@ export const getProperties = async (c) => {
         timestamp,
       }, 200);
     } catch (finalErr) {
-      console.error('❌ getProperties final fallback failed:', finalErr?.message || finalErr);
+      console.error('getProperties final fallback failed:', finalErr?.message || finalErr);
       return c.json({
         success: false,
         error: 'QUERY_FAILED',

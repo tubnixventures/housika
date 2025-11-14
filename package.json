@@ -13,6 +13,7 @@
     "@hono/node-server": "^1.19.6",
     "@upstash/redis": "^1.35.6",
     "bcryptjs": "^3.0.3",
+    "compression": "^1.8.1",
     "cookie": "^1.0.2",
     "dotenv": "^17.2.3",
     "hono": "^4.10.4",

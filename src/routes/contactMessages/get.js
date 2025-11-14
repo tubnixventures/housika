@@ -1,138 +1,197 @@
 import crypto from 'crypto';
 import { getCollection } from '../../services/astra.js';
-import { checkToken } from '../../utils/auth.js';
+import { checkToken, redis as upstashRedis } from '../../utils/auth.js';
 
-/**
- * GET /contactMessages
- * Returns paginated contact messages for authorized roles.
- * Only accessible by customer care, admin, or ceo.
- *
- * Query params:
- *  - page (number, default 1)
- *  - per_page (number, default 20, max 100)
- *  - email (string)          => filter by exact email
- *  - from (ISO date string)  => created_at >= from
- *  - to (ISO date string)    => created_at <= to
- *  - replied (true|false|any) => priority ordering + optional filter
- *
- * Response: { success, count, data, pagination, timestamp, traceId, actor_id }
- */
+// Cache config
+const CACHE_KEY_PREFIX = process.env.CACHE_KEY_PREFIX || 'cache';
+const CACHE_TTL_SEC = Number(process.env.CACHE_TTL_SEC || 30); // short TTL for messages listing
+const INMEM_TTL_MS = Number(process.env.INMEM_CONTACT_TTL_MS || 5000);
+const INMEM_MAX = Number(process.env.INMEM_CONTACT_MAX || 200);
+
+// in-process fallback cache
+const inMemCache = new Map(); // key -> { ts, value }
+const cleanupInMem = () => {
+  if (inMemCache.size <= INMEM_MAX) return;
+  const keys = Array.from(inMemCache.keys()).sort((a, b) => inMemCache.get(a).ts - inMemCache.get(b).ts);
+  for (let i = 0; i < Math.floor(keys.length / 4); i += 1) {
+    inMemCache.delete(keys[i]);
+    if (inMemCache.size <= INMEM_MAX) break;
+  }
+};
+const inMemGet = (k) => {
+  const e = inMemCache.get(k);
+  if (!e) return null;
+  if (Date.now() - e.ts > INMEM_TTL_MS) {
+    inMemCache.delete(k);
+    return null;
+  }
+  return e.value;
+};
+const inMemSet = (k, v) => {
+  inMemCache.set(k, { ts: Date.now(), value: v });
+  cleanupInMem();
+};
+
+// Redis helpers (best-effort)
+const redisGet = async (key) => {
+  try {
+    const raw = await upstashRedis.get(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn('Redis get error (contact messages):', e?.message || e);
+    return null;
+  }
+};
+const redisSet = async (key, payload, ttlSec = CACHE_TTL_SEC) => {
+  try {
+    await upstashRedis.set(key, JSON.stringify(payload));
+    if (typeof upstashRedis.expire === 'function') {
+      await upstashRedis.expire(key, ttlSec);
+    }
+  } catch (e) {
+    console.warn('Redis set error (contact messages):', e?.message || e);
+  }
+};
+
+// projection to return only required fields
+const projectMessage = (m) => ({
+  id: m.id || m._id || null,
+  fullname: m.fullname || m.name || null,
+  email: m.email || null,
+  phonenumber: m.phonenumber || m.phone || null,
+  subject: m.subject || null,
+  body: m.body || m.message || null,
+  replied: !!m.replied,
+  created_at: m.created_at || m.createdAt || null,
+  metadata: m.metadata || null,
+});
+
+// deterministic cache key for the query and pagination
+const makeCacheKey = ({ email, from, to, repliedQ, page, per_page }) => {
+  const parts = [
+    `${CACHE_KEY_PREFIX}:contact_messages`,
+    `email=${email || ''}`,
+    `from=${from || ''}`,
+    `to=${to || ''}`,
+    `replied=${repliedQ || 'any'}`,
+    `p=${page}`,
+    `pp=${per_page}`,
+  ];
+  return parts.join('|');
+};
+
 export const getContactMessages = async (c) => {
   const timestamp = new Date().toISOString();
-  const traceId = c.req.header('x-trace-id') || crypto.randomUUID();
-  const token = c.req.header('Authorization')?.replace('Bearer ', '');
+  const traceId = c.req.header('x-trace-id') || crypto.randomUUID?.() || `trace-${Date.now()}`;
+  const token = c.req.header('Authorization')?.replace('Bearer ', '') || '';
 
-  const [actorResult, collectionResult] = await Promise.allSettled([
-    token ? checkToken(token) : null,
-    getCollection('contact_messages'),
-  ]);
-
-  const actor = actorResult.status === 'fulfilled' ? actorResult.value : null;
-  const contactMessages = collectionResult.status === 'fulfilled' ? collectionResult.value : null;
-
+  // Quick auth + role check
+  if (!token) {
+    return c.json({ success: false, error: 'MISSING_TOKEN', message: 'Missing authentication token.', timestamp, traceId }, 401);
+  }
+  const actor = await checkToken(token).catch((err) => {
+    console.error('❌ Token check failed:', err?.message || err);
+    return null;
+  });
   if (!actor || !['customer care', 'admin', 'ceo'].includes(actor.role)) {
-    return c.json({
-      success: false,
-      error: 'UNAUTHORIZED',
-      message: 'Only customer care, admin, or ceo can view contact messages.',
-      timestamp,
-      traceId,
-    }, 403);
+    return c.json({ success: false, error: 'UNAUTHORIZED', message: 'Only customer care, admin, or ceo can view contact messages.', timestamp, traceId }, 403);
   }
 
-  if (!contactMessages) {
-    if (process.env.NODE_ENV !== 'production') {
-      console.error('❌ DB connection failed:', collectionResult.reason?.message || collectionResult.reason);
+  // Resolve collection
+  let contactMessages;
+  try {
+    contactMessages = await getCollection('contact_messages');
+    if (!contactMessages || typeof contactMessages.find !== 'function') {
+      throw new Error('Collection "contact_messages" missing .find() method.');
     }
-    return c.json({
-      success: false,
-      error: 'DB_CONNECTION_FAILED',
-      message: 'Database connection failed.',
-      timestamp,
-      traceId,
-    }, 503);
+  } catch (err) {
+    console.error('❌ DB connection failed:', err?.message || err);
+    return c.json({ success: false, error: 'DB_CONNECTION_FAILED', message: 'Database connection failed.', timestamp, traceId }, 503);
   }
 
-  // Pagination params
+  // Parse query params
   const rawPage = c.req.query('page') || '1';
-  const rawPerPage = c.req.query('per_page') || '20';
+  const rawPerPage = c.req.query('per_page') || c.req.query('perPage') || '20';
   const page = Math.max(1, parseInt(rawPage, 10) || 1);
-  const perPage = Math.min(100, Math.max(1, parseInt(rawPerPage, 10) || 20));
+  const per_page = Math.min(100, Math.max(1, parseInt(rawPerPage, 10) || 20));
 
-  // Filters
-  const emailFilter = c.req.query('email');
-  const fromDate = c.req.query('from');
-  const toDate = c.req.query('to');
-  const repliedQ = c.req.query('replied'); // expected 'true' | 'false' | 'any' (or undefined)
+  const email = c.req.query('email') || '';
+  const from = c.req.query('from') || '';
+  const to = c.req.query('to') || '';
+  const repliedQ = (c.req.query('replied') || '').toLowerCase(); // 'true' | 'false' | 'any' | ''
 
-  // Build DB query object (best-effort, kept compatible with existing find usage)
+  const cacheKey = makeCacheKey({ email, from, to, repliedQ, page, per_page });
+
+  // Try caches
+  const cachedRedis = await redisGet(cacheKey);
+  if (cachedRedis != null) {
+    c.header('X-Cache', 'HIT-REDIS');
+    c.set('cachePayload', cachedRedis.data);
+    return c.json({ success: true, ...cachedRedis.meta, data: cachedRedis.data, cached: true, timestamp, traceId, actor_id: actor.userId }, 200);
+  }
+  const cachedMem = inMemGet(cacheKey);
+  if (cachedMem != null) {
+    c.header('X-Cache', 'HIT-MEM');
+    c.set('cachePayload', cachedMem.data);
+    return c.json({ success: true, ...cachedMem.meta, data: cachedMem.data, cached: true, timestamp, traceId, actor_id: actor.userId }, 200);
+  }
+
+  // Build DB query object
   const query = {};
-  if (emailFilter) query.email = { $eq: emailFilter };
-  if (fromDate || toDate) {
+  if (email) query.email = { $eq: email };
+  if (from || to) {
     query.created_at = {};
-    if (fromDate) query.created_at.$gte = fromDate;
-    if (toDate) query.created_at.$lte = toDate;
+    if (from) query.created_at.$gte = from;
+    if (to) query.created_at.$lte = to;
   }
-  if (repliedQ === 'true') {
-    query.replied = { $eq: true };
-  } else if (repliedQ === 'false') {
-    query.replied = { $eq: false };
-  }
-  // Note: if repliedQ is 'any' or undefined, we do not add replied filter;
-  // later we will prioritise unreplied messages first in sorting.
+  if (repliedQ === 'true') query.replied = { $eq: true };
+  else if (repliedQ === 'false') query.replied = { $eq: false };
+  // if repliedQ is 'any' or empty -> no replied filter, we'll prioritise later
 
+  // Fetch matching messages
   let messages = [];
   try {
-    const result = await contactMessages.find(query);
-    messages = Object.values(result?.data || {});
-  } catch (err) {
-    if (process.env.NODE_ENV !== 'production') {
-      console.error('❌ Query failed:', err.message || err);
+    // Try server-side pagination if supported
+    let result;
+    try {
+      result = await contactMessages.find(query, { limit: per_page, offset: (page - 1) * per_page, sort: { replied: 1, created_at: -1 } });
+    } catch (_) {
+      // fallback to unpaged fetch
+      result = await contactMessages.find(query);
     }
-    return c.json({
-      success: false,
-      error: 'QUERY_FAILED',
-      message: 'Failed to retrieve contact messages.',
-      timestamp,
-      traceId,
-    }, 500);
+    messages = Array.isArray(result?.data) ? result.data : Object.values(result?.data || {});
+  } catch (err) {
+    console.error('❌ Query failed:', err?.message || err);
+    return c.json({ success: false, error: 'QUERY_FAILED', message: 'Failed to retrieve contact messages.', timestamp, traceId }, 500);
   }
 
-  // Normalise created_at to Date for sorting safety (don't mutate original objects)
-  const withDates = messages.map((m) => ({
+  // Normalize and prioritise unreplied then newest
+  const normalized = messages.map((m) => ({
     ...m,
     __created_at_date: m.created_at ? new Date(m.created_at) : new Date(0),
     __replied_bool: !!m.replied,
   }));
 
-  // Sort:
-  // 1) unreplied messages first (replied: false before true)
-  // 2) then by created_at desc (newest first)
-  withDates.sort((a, b) => {
-    if (a.__replied_bool !== b.__replied_bool) {
-      return a.__replied_bool ? 1 : -1; // unreplied (false) come first
-    }
+  normalized.sort((a, b) => {
+    if (a.__replied_bool !== b.__replied_bool) return a.__replied_bool ? 1 : -1;
     return b.__created_at_date - a.__created_at_date;
   });
 
-  // Pagination calculations
-  const total = withDates.length;
-  const totalPages = Math.max(1, Math.ceil(total / perPage));
+  // If server-side paging wasn't applied, slice here
+  const total = normalized.length;
+  const totalPages = Math.max(1, Math.ceil(total / per_page));
   const currentPage = Math.min(page, totalPages);
-  const start = (currentPage - 1) * perPage;
-  const end = start + perPage;
-  const pageItems = withDates.slice(start, end).map((m) => {
-    // remove internal helpers before returning
+  const start = (currentPage - 1) * per_page;
+  const pageSlice = normalized.slice(start, start + per_page).map((m) => {
     const { __created_at_date, __replied_bool, ...rest } = m;
-    return rest;
+    return projectMessage(rest);
   });
 
-  // Build pages array for frontend (prev, numbered pages, next)
-  // We will show up to 5 page buttons centered around current when possible
+  // Build pagination buttons (up to 5, centered)
   const maxButtons = 5;
   let startPage = 1;
   let endPage = Math.min(totalPages, maxButtons);
-
   if (totalPages > maxButtons) {
     const half = Math.floor(maxButtons / 2);
     startPage = Math.max(1, currentPage - half);
@@ -142,18 +201,12 @@ export const getContactMessages = async (c) => {
       startPage = totalPages - maxButtons + 1;
     }
   }
-
   const pages = [];
-  for (let p = startPage; p <= endPage; p += 1) {
-    pages.push({
-      page: p,
-      is_current: p === currentPage,
-    });
-  }
+  for (let p = startPage; p <= endPage; p += 1) pages.push({ page: p, is_current: p === currentPage });
 
   const pagination = {
     total,
-    per_page: perPage,
+    per_page,
     current_page: currentPage,
     total_pages: totalPages,
     prev_page: currentPage > 1 ? currentPage - 1 : null,
@@ -161,13 +214,18 @@ export const getContactMessages = async (c) => {
     pages,
   };
 
-  return c.json({
-    success: true,
-    count: pageItems.length,
-    data: pageItems,
+  const meta = {
+    count: pageSlice.length,
     pagination,
-    timestamp,
-    traceId,
     actor_id: actor.userId,
-  }, 200);
+  };
+
+  // Best-effort caching
+  const payloadToCache = { meta, data: pageSlice };
+  inMemSet(cacheKey, payloadToCache);
+  await redisSet(cacheKey, payloadToCache, CACHE_TTL_SEC);
+
+  c.set('cachePayload', pageSlice);
+  c.header('X-Cache', 'MISS');
+  return c.json({ success: true, ...meta, data: pageSlice, timestamp, traceId, actor_id: actor.userId }, 200);
 };
